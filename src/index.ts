@@ -2,61 +2,44 @@ import { DurableObject } from "cloudflare:workers"
 
 const FlushIntervalMs = 100
 
-interface RPCMessage {
-	method: "produce" | "consume" | "ack"
-	payload: ProducePayload | ConsumePayload | AckPayload
-	id: string
+interface AckRPC {
+	offset: string
 }
 
-type ProducePayload = any[]
-
-interface ConsumePayload {
-	consumerID: string
-
-	/**
-	 * Optional offset to start consuming from, overwrites the current consumer
-	 */
-	offset?: string
-
-	/**
-	 * Whether to persist the offset for the consumer
-	 */
-	persistOffset?: boolean
-}
-
-interface AckPayload {
-	messageOffset: string
-}
-
-interface PendingMessage {
-	content: any[]
-	produceMessageID: string
-	websocket: WebSocket
+interface ProduceBody {
+	records: any[]
 }
 
 export class StreamCoordinator extends DurableObject<Env> {
 	connectedWebsockets: number = 0
-	producers: Map<WebSocket, string> = new Map()
 	consumers: Map<WebSocket, string> = new Map()
 
 	lastOffset: string = ""
 
 	// Messages that are pending persistence in the flush interval
-	pendingMessages: Set<PendingMessage> = new Set()
+	pendingMessages: Set<any> = new Set() // TODO: signal to the request handlers that they can respond
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env)
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		if (request.method === "POST") {
+			return this.handleProduce(request)
+		}
+
+		const url = new URL(request.url)
+		const consumerID = url.searchParams.get("consumer_id")
+		if (!consumerID) {
+			return new Response("Missing consumer_id query parameter", { status: 400 })
+		}
+
 		const webSocketPair = new WebSocketPair()
 		const [client, server] = Object.values(webSocketPair)
 
 		this.ctx.acceptWebSocket(server)
-
-		const connectionId = crypto.randomUUID()
 		this.connectedWebsockets++
-		server.send(JSON.stringify({ type: "connectionId", connectionId }))
+		this.consumers.set(server, consumerID)
 
 		return new Response(null, {
 			status: 101,
@@ -64,70 +47,35 @@ export class StreamCoordinator extends DurableObject<Env> {
 		})
 	}
 
+	async handleProduce(request: Request): Promise<Response> {
+		const body = await request.json()
+		const messageID = body.id
+		const payload = body.payload
+
+		// TODO: persist the message
+		return new Response(JSON.stringify({ type: "produce", id: messageID }))
+	}
+
 	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-		let messageJson: RPCMessage
+		let params: AckRPC
 		try {
-			messageJson = JSON.parse(message.toString())
+			params = JSON.parse(message.toString())
 		} catch (error) {
 			console.error(error)
 			return
 		}
 
-		switch (messageJson.method) {
-			case "produce":
-				this.handleProduce(ws, messageJson.id, messageJson.payload as ProducePayload)
-				break
-			case "consume":
-				this.handleConsume(ws, messageJson.id, messageJson.payload as ConsumePayload)
-				break
-			case "ack":
-				this.handleAck(ws, messageJson.id, messageJson.payload as AckPayload)
-				break
-		}
+		this.handleAck(ws, params)
 	}
 
 	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
 		this.connectedWebsockets--
-		this.producers.delete(ws)
 		this.consumers.delete(ws)
 	}
 
 	async webSocketError(ws: WebSocket, error: unknown) {}
 
-	async handleProduce(ws: WebSocket, messageID: string, payload: ProducePayload) {
-		let producerID: string
-		if (!this.producers.has(ws)) {
-			// Register the producer
-			producerID = crypto.randomUUID()
-			this.producers.set(ws, producerID)
-		} else {
-			producerID = this.producers.get(ws)!
-		}
-
-		if (this.pendingMessages.size === 0) {
-			// Set the alarm in the future
-			console.log(`Setting alarm for now + ${FlushIntervalMs}ms`)
-			this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
-		}
-
-		// Stage the message for persistence
-		this.pendingMessages.add({
-			content: payload,
-			websocket: ws,
-			produceMessageID: messageID,
-		})
-	}
-
-	async handleConsume(ws: WebSocket, messageID: string, payload: ConsumePayload) {
-		// Register consumer
-		if (this.consumers.has(ws)) {
-			// TODO: send a rejection message
-		} else {
-			this.consumers.set(ws, messageID)
-		}
-	}
-
-	async handleAck(ws: WebSocket, messageID: string, payload: AckPayload) {
+	async handleAck(ws: WebSocket, params: AckRPC) {
 		// TODO persist the ack if it's forward oh where it currently is (if exists)
 		// TODO
 	}
