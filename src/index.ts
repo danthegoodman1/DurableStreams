@@ -30,6 +30,7 @@ interface AckPayload {
 
 interface PendingMessage {
 	content: any[]
+	produceMessageID: string
 	websocket: WebSocket
 }
 
@@ -113,6 +114,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		this.pendingMessages.add({
 			content: payload,
 			websocket: ws,
+			produceMessageID: messageID,
 		})
 	}
 
