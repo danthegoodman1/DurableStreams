@@ -33,7 +33,7 @@ interface PendingMessage {
 	websocket: WebSocket
 }
 
-export class MyDurableObject extends DurableObject<Env> {
+export class StreamCoordinator extends DurableObject<Env> {
 	connectedWebsockets: number = 0
 	producers: Map<WebSocket, string> = new Map()
 	consumers: Map<WebSocket, string> = new Map()
@@ -144,8 +144,8 @@ export class MyDurableObject extends DurableObject<Env> {
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		let id = env.MyDO.idFromName(new URL(request.url).pathname)
-		let stub = env.MyDO.get(id)
+		let id = env.StreamCoordinator.idFromName(new URL(request.url).pathname)
+		let stub = env.StreamCoordinator.get(id)
 		return stub.fetch(request)
 	},
 } satisfies ExportedHandler<Env>
