@@ -63,8 +63,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		this.setup_listener!.emit("finish")
 	}
 
-	buildR2Key(offset: string) {
-		return `${this.streamName}/${offset}`
+	buildR2Key(epoch: Number) {
+		return `${this.streamName}/${epoch}`
 	}
 
 	async storeLatestOffset(latest: string, comitted: string) {
@@ -104,7 +104,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		// If the offsets don't match, check R2
 		console.warn("Offsets don't match, checking R2 to see if we committed")
-		const segmentFile = await this.env.StreamData.get(this.buildR2Key(latestOffset.staged))
+		// TODO: use the index to find where the offset is in the segment files
+		const segmentFile = await this.env.StreamData.get(this.buildR2Key(parseOffset(latestOffset.staged)[0]))
 
 		// Staged is always ahead of or the same as comitted, let's set the epoch as later we check to make sure we
 		// are not behind (we check later to make sure new writes use a later epoch)
@@ -240,6 +241,25 @@ export class StreamCoordinator extends DurableObject<Env> {
 	async writeLogSegment(epoch: number, counter: number, records: any[]) {
 		// TODO: write the segment to R2, named after the first record in the segment
 		// TODO: each record is a new line, 33 bytes for the name, then the JSON record
+		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
+		const writer = writable.getWriter()
+
+		// start streaming the records to the file
+		// TODO: with the first segment
+		// TODO: With the correct key that's to be stored in the index
+		const writePromise = this.env.StreamData.put(this.buildR2Key(epoch), readable)
+
+		// TODO: write the records to the stream
+		for (const record of records) {
+			const name = record.name // TODO: fix this
+			const json = JSON.stringify(record)
+			const nameBuffer = new TextEncoder().encode(name)
+			const jsonBuffer = new TextEncoder().encode(json)
+			writer.write(nameBuffer)
+			writer.write(jsonBuffer)
+		}
+
+		await Promise.all([writer.close(), writePromise])
 	}
 
 	async compactLogSegments() {
