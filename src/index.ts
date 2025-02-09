@@ -238,7 +238,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// TODO respond to the sockets with their new offsets
 	}
 
-	async writeLogSegment(epoch: number, counter: number, records: any[]) {
+	async writeLogSegment(segmentName: string, records: any[]) {
 		// TODO: write the segment to R2, named after the first record in the segment
 		// TODO: each record is a new line, 33 bytes for the name, then the JSON record
 		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
@@ -247,7 +247,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// start streaming the records to the file
 		// TODO: with the first segment
 		// TODO: With the correct key that's to be stored in the index
-		const writePromise = this.env.StreamData.put(this.buildR2Key(epoch), readable)
+		const writePromise = this.env.StreamData.put(segmentName, readable)
 
 		// TODO: write the records to the stream
 		for (const record of records) {
