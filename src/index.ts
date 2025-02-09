@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers"
+import { EventEmitter } from "node:events"
 
 const FlushIntervalMs = 100
 
@@ -17,7 +18,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 	lastOffset: string = ""
 
 	// Messages that are pending persistence in the flush interval
-	pendingMessages: Set<any> = new Set() // TODO: signal to the request handlers that they can respond
+	pendingMessages: Set<{
+		emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
+		records: any[]
+	}> = new Set() // TODO: signal to the request handlers that they can respond
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env)
@@ -48,12 +52,26 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async handleProduce(request: Request): Promise<Response> {
-		const body = await request.json()
-		const messageID = body.id
-		const payload = body.payload
+		const body: ProduceBody = await request.json()
 
-		// TODO: persist the message
-		return new Response(JSON.stringify({ type: "produce", id: messageID }))
+		// Submit for persistence and wait
+		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
+		this.pendingMessages.add({ emitter, records: body.records })
+		const offsetOrError = await Promise.any([
+			new Promise<string[]>((resolve) => emitter.once("resolve", resolve)),
+			new Promise<Error>((resolve) => emitter.once("error", resolve)),
+		])
+
+		if (offsetOrError instanceof Error) {
+			return new Response(JSON.stringify({ error: offsetOrError.message }), {
+				status: 500,
+			})
+		}
+
+		// Return the persistence result
+		return new Response(JSON.stringify({ offsets: offsetOrError }), {
+			status: 200,
+		})
 	}
 
 	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
