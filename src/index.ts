@@ -90,7 +90,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		const latestOffset = await this.ctx.storage.get<LatestOffset>(latestOffsetKey)
 		if (!latestOffset) {
 			// This is a fresh instance
-			console.log("No offset found, is this a fresh instance?")
+			console.log("No offset found, must be a fresh instance")
 			this.finishSetup()
 			return
 		}
@@ -104,6 +104,11 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// If the offsets don't match, check R2
 		console.warn("Offsets don't match, checking R2 to see if we committed")
 		const segmentFile = await this.env.StreamData.get(this.buildR2Key(latestOffset.staged))
+
+		// Staged is always ahead of or the same as comitted, let's set the epoch as later we check to make sure we
+		// are not behind (we check later to make sure new writes use a later epoch)
+		const [stagedEpoch] = parseOffset(latestOffset.staged)
+		this.epoch = stagedEpoch
 
 		if (segmentFile) {
 			// We have a segment file, so we can implicitly commit the offset
