@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events"
 const FlushIntervalMs = 100
 
 const latestOffsetKey = "_latest_offset"
+const logSegmentKeyPrefix = "log_segment::"
 
 interface LatestOffset {
 	/**
@@ -234,6 +235,16 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// TODO: - this is a whole ordeal with keeping track of what is merged and what's not via Kv storage?
 		// TODO persist latest offset with 2PC (with intended R2 segment write)
 		// TODO respond to the sockets with their new offsets
+	}
+
+	async writeLogSegment(epoch: number, counter: number, records: any[]) {
+		// TODO: write the segment to R2, named after the first record in the segment
+		// TODO: each record is a new line, 33 bytes for the name, then the JSON record
+	}
+
+	async compactLogSegments() {
+		// TODO: check metadata to see if we need to compact log segments
+		// TODO: k-way merge the segments with line readers
 	}
 }
 
