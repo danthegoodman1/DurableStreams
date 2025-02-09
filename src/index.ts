@@ -14,6 +14,7 @@ interface ProduceBody {
 export class StreamCoordinator extends DurableObject<Env> {
 	connectedWebsockets: number = 0
 	consumers: Map<WebSocket, string> = new Map()
+	consumerOffsets: Map<string, string> = new Map()
 
 	lastOffset: string = ""
 
@@ -37,6 +38,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		if (!consumerID) {
 			return new Response("Missing consumer_id query parameter", { status: 400 })
 		}
+		const fromOffset = url.searchParams.get("from_offset")
+		this.consumerOffsets.set(consumerID, fromOffset || "")
 
 		const webSocketPair = new WebSocketPair()
 		const [client, server] = Object.values(webSocketPair)
@@ -96,6 +99,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 	async handleAck(ws: WebSocket, params: AckRPC) {
 		// TODO persist the ack if it's forward oh where it currently is (if exists)
 		// TODO
+	}
+
+	async onConsumerConnect(ws: WebSocket, consumerID: string) {
+		// TODO: check get their current offset from storage to check if they are overwriting
+		// TODO: if the offset is "-" then we should set them to the latest offset
+		// TODO: otherwise we need to send messages to them from the latest offset until the current offset
 	}
 
 	async alarm(alarmInfo?: AlarmInvocationInfo) {
