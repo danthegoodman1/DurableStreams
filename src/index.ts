@@ -24,6 +24,16 @@ interface ProduceBody {
 	records: any[]
 }
 
+function parseOffset(offset: string): [number, number] {
+	const [epoch, counter] = offset.split(":")
+	return [Number(epoch), Number(counter)]
+}
+
+function serializeOffset(epoch: number, counter: number): string {
+	// 16 digits is max safe integer for JS
+	return `${epoch.toString().padStart(16, "0")}:${counter.toString().padStart(16, "0")}`
+}
+
 export class StreamCoordinator extends DurableObject<Env> {
 	connectedWebsockets: number = 0
 	consumers: Map<WebSocket, string> = new Map()
@@ -31,6 +41,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 	lastOffset: string = ""
 	streamName: string = ""
+	epoch: number = Date.now()
+	counter: number = 0
 
 	// Messages that are pending persistence in the flush interval
 	pendingMessages: Set<{
@@ -201,7 +213,18 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async flushPendingMessages() {
+		// Increment the epoch and reset the counter
+		const oldEpoch = this.epoch
+		this.epoch = Date.now()
+		this.counter = 0
+		if (this.epoch <= oldEpoch) {
+			// What the heck, we went back in time? Clocks man... Let's just jump forward by 1
+			console.warn("Clock went back in time, incrementing epoch")
+			this.epoch = oldEpoch + 1
+		}
+
 		const offsets: string[][] = []
+
 		// TODO persist logs
 		// TODO: - this is a whole ordeal with keeping track of what is merged and what's not via Kv storage?
 		// TODO persist latest offset with 2PC (with intended R2 segment write)
