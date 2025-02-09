@@ -97,8 +97,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	async webSocketError(ws: WebSocket, error: unknown) {}
 
 	async handleAck(ws: WebSocket, params: AckRPC) {
-		// TODO persist the ack if it's forward oh where it currently is (if exists)
-		// TODO
+		// TODO persist the ack if it's forward of where it currently is (if exists)
 	}
 
 	async onConsumerConnect(ws: WebSocket, consumerID: string) {
