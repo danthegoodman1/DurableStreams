@@ -3,7 +3,18 @@ import { EventEmitter } from "node:events"
 
 const FlushIntervalMs = 100
 
-const persistedSegmentPrefix = "segment::" // segment::<offset of first record>
+const latestOffsetKey = "_latest_offset"
+
+interface LatestOffset {
+	/**
+	 * The latest offset that has been staged for persistence
+	 */
+	staged: string
+	/**
+	 * The latest offset that has been comitted to R2
+	 */
+	comitted: string
+}
 
 interface AckRPC {
 	offset: string
@@ -43,8 +54,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		return `${this.streamName}/${offset}`
 	}
 
-	async storeLatestSegment(startOffset: string, createdTimestamp: string) {
-		await this.ctx.storage.put(`${persistedSegmentPrefix}${startOffset}`, createdTimestamp)
+	async storeLatestOffset(latest: string, comitted: string) {
+		await this.ctx.storage.put(latestOffsetKey, JSON.stringify({ latest, comitted }))
 	}
 
 	/**
@@ -64,42 +75,35 @@ export class StreamCoordinator extends DurableObject<Env> {
 		this.setup_listener = new EventEmitter<{ finish: [] }>()
 
 		// load the latest offset from storage
-		const segments = await this.ctx.storage.list({
-			prefix: persistedSegmentPrefix,
-			reverse: true,
-			limit: 2,
-		})
-		const latestSegment = segments.keys().next().value
-		if (!latestSegment) {
+		const latestOffset = await this.ctx.storage.get<LatestOffset>(latestOffsetKey)
+		if (!latestOffset) {
 			// This is a fresh instance
 			console.log("No offset found, is this a fresh instance?")
 			this.finishSetup()
 			return
 		}
-
-		// Verify that this segment exists in R2
-		console.warn("Offsets don't match, checking R2 to see if we committed")
-		const segmentFile = await this.env.StreamData.get(this.buildR2Key(latestSegment.split(persistedSegmentPrefix)[1]))
-
-		if (segmentFile) {
-			// We have a segment file, we're good
-			console.log("Segment file found, finishing setup")
+		if (latestOffset.staged === latestOffset.comitted) {
+			// The offsets match, so we can finish setup
+			console.log("Offsets match, finishing setup")
 			this.finishSetup()
 			return
 		}
 
-		// Otherwise we died during commit, so we need to roll back the offset
-		console.warn(`No segment file found, deleting segment commit record for ${latestSegment.split(persistedSegmentPrefix)[1]}`)
-		await this.ctx.storage.delete(latestSegment)
+		// If the offsets don't match, check R2
+		console.warn("Offsets don't match, checking R2 to see if we committed")
+		const segmentFile = await this.env.StreamData.get(this.buildR2Key(latestOffset.staged))
 
-		if (segments.size > 1) {
-			const previousSegment = segments.keys().next().value
-			console.warn(`Setting last offset to ${previousSegment!.split(persistedSegmentPrefix)[1]}`)
-			this.lastOffset = previousSegment!.split(persistedSegmentPrefix)[1]
-		} else {
-			console.warn("No previous segment found, setting last offset to empty string")
-			this.lastOffset = ""
+		if (segmentFile) {
+			// We have a segment file, so we can implicitly commit the offset
+			console.log(`Segment file found, implicitly committing offset to staged offset: ${latestOffset.staged}`)
+			await this.storeLatestOffset(latestOffset.staged, latestOffset.staged)
+			this.finishSetup()
+			return
 		}
+
+		// Otherwise we died during the 2PC, so we need to truncate
+		console.warn(`No segment file found, truncating to last committed offset: ${latestOffset.comitted}`)
+		await this.storeLatestOffset(latestOffset.comitted, latestOffset.comitted)
 
 		this.finishSetup()
 	}
@@ -138,14 +142,13 @@ export class StreamCoordinator extends DurableObject<Env> {
 	async handleProduce(request: Request): Promise<Response> {
 		const body: ProduceBody = await request.json()
 
-		// Submit for persistence and wait
-		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
-
 		if (this.pendingMessages.size === 0) {
-			// Set the alarm to flush the pending messages in the future
+			// Set the alarm to flush the pending messages
 			await this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
 		}
 
+		// Submit for persistence and wait
+		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
 		this.pendingMessages.add({ emitter, records: body.records })
 		const offsetOrError = await Promise.any([
 			new Promise<string[]>((resolve) => emitter.once("resolve", resolve)),
