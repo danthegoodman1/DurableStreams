@@ -203,6 +203,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	async flushPendingMessages() {
 		const offsets: string[][] = []
 		// TODO persist logs
+		// TODO: - this is a whole ordeal with keeping track of what is merged and what's not via Kv storage?
 		// TODO persist latest offset with 2PC (with intended R2 segment write)
 		// TODO respond to the sockets with their new offsets
 	}
