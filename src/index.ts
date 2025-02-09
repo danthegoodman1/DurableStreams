@@ -22,7 +22,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	pendingMessages: Set<{
 		emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
 		records: any[]
-	}> = new Set() // TODO: signal to the request handlers that they can respond
+	}> = new Set()
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env)
