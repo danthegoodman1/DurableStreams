@@ -1,12 +1,16 @@
+export const logSegmentKeyPrefix = "log_segment::"
+
 export interface SegmentMetadata {
 	firstOffset: string
 	lastOffset: string
+	createdMS: number
+	name: string
 }
 
 /**
  * Async generator that yields each line from a ReadableStream.
  */
-async function* readLines(stream: ReadableStream<Uint8Array>) {
+export async function* readLines(stream: ReadableStream<Uint8Array>) {
 	const reader = stream.getReader()
 	const decoder = new TextDecoder()
 	let { value: chunk, done } = await reader.read()
@@ -31,4 +35,8 @@ async function* readLines(stream: ReadableStream<Uint8Array>) {
 	if (buffer) {
 		yield buffer
 	}
+}
+
+export function buildLogSegmentName(epoch: number, uuid: string) {
+	return `${logSegmentKeyPrefix}${epoch}:${uuid}`
 }

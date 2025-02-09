@@ -4,7 +4,6 @@ import { EventEmitter } from "node:events"
 const FlushIntervalMs = 100
 
 const latestOffsetKey = "_latest_offset"
-const logSegmentKeyPrefix = "log_segment::"
 
 interface LatestOffset {
 	/**
@@ -231,11 +230,23 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		const offsets: string[][] = []
+		for (const message of this.pendingMessages) {
+			// For each of the writes, we need to generate an offset for each record
+			const messageOffsets = []
+			for (const _ of message.records) {
+				// For each record, we need to generate an offset
+				messageOffsets.push(serializeOffset(this.epoch, this.counter))
+				this.counter++
+
+				// TODO We also need to write it to the log segment
+			}
+			offsets.push(messageOffsets)
+		}
 
 		// TODO persist logs
 		// TODO: - this is a whole ordeal with keeping track of what is merged and what's not via Kv storage?
 		// TODO persist latest offset with 2PC (with intended R2 segment write)
-		// TODO respond to the sockets with their new offsets
+		// TODO respond to the writers with their new offsets
 	}
 
 	async writeLogSegment(segmentName: string, records: any[]) {
