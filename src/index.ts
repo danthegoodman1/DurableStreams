@@ -142,14 +142,13 @@ export class StreamCoordinator extends DurableObject<Env> {
 	async handleProduce(request: Request): Promise<Response> {
 		const body: ProduceBody = await request.json()
 
-		if (this.pendingMessages.size === 0) {
-			// Set the alarm to flush the pending messages
-			await this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
-		}
-
 		// Submit for persistence and wait
 		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
 		this.pendingMessages.add({ emitter, records: body.records })
+		if (this.pendingMessages.size === 1) {
+			// Set the alarm to flush the pending messages
+			await this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
+		}
 		const offsetOrError = await Promise.any([
 			new Promise<string[]>((resolve) => emitter.once("resolve", resolve)),
 			new Promise<Error>((resolve) => emitter.once("error", resolve)),
