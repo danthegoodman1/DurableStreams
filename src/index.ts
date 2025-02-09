@@ -3,6 +3,18 @@ import { EventEmitter } from "node:events"
 
 const FlushIntervalMs = 100
 
+const latestOffsetKey = "_latest_offset"
+interface LatestOffset {
+	/**
+	 * The latest offset that has been staged for persistence
+	 */
+	staged: string
+	/**
+	 * The latest offset that has been comitted to R2
+	 */
+	comitted: string
+}
+
 interface AckRPC {
 	offset: string
 }
@@ -17,6 +29,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	consumerOffsets: Map<string, string> = new Map()
 
 	lastOffset: string = ""
+	streamName: string = ""
 
 	// Messages that are pending persistence in the flush interval
 	pendingMessages: Set<{
@@ -24,11 +37,82 @@ export class StreamCoordinator extends DurableObject<Env> {
 		records: any[]
 	}> = new Set()
 
+	setup_listener?: EventEmitter<{ finish: [] }>
+	setup = false
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env)
 	}
 
+	finishSetup() {
+		this.setup = true
+		this.setup_listener!.emit("finish")
+	}
+
+	buildR2Key(offset: string) {
+		return `${this.streamName}/${offset}`
+	}
+
+	async storeLatestOffset(latest: string, comitted: string) {
+		await this.ctx.storage.put(latestOffsetKey, JSON.stringify({ latest, comitted }))
+	}
+
+	/**
+	 * Ensures that we load the latest state from storage before we being processing requests
+	 */
+	async ensureSetup() {
+		if (this.setup_listener) {
+			console.log("Waiting for setup to finish")
+			// We are not the first instance to start up, so wait for the setup to finish
+			await new Promise<void>((resolve) => this.setup_listener!.once("finish", resolve))
+			return
+		}
+
+		console.log("Doing setup")
+
+		// We are the first instance to start up, so we need to do the setup
+		this.setup_listener = new EventEmitter<{ finish: [] }>()
+
+		// load the latest offset from storage
+		const latestOffset = await this.ctx.storage.get<LatestOffset>(latestOffsetKey)
+		if (!latestOffset) {
+			// This is a fresh instance
+			console.log("No offset found, is this a fresh instance?")
+			this.finishSetup()
+			return
+		}
+		if (latestOffset.staged === latestOffset.comitted) {
+			// The offsets match, so we can finish setup
+			console.log("Offsets match, finishing setup")
+			this.finishSetup()
+			return
+		}
+
+		// If the offsets don't match, check R2
+		console.warn("Offsets don't match, checking R2 to see if we committed")
+		const segmentFile = await this.env.StreamData.get(this.buildR2Key(latestOffset.staged))
+
+		if (segmentFile) {
+			// We have a segment file, so we can implicitly commit the offset
+			console.log(`Segment file found, implicitly committing offset to staged offset: ${latestOffset.staged}`)
+			await this.storeLatestOffset(latestOffset.staged, latestOffset.staged)
+			this.finishSetup()
+			return
+		}
+
+		// Otherwise we died during the 2PC, so we need to truncate
+		console.warn(`No segment file found, truncating to last committed offset: ${latestOffset.comitted}`)
+		await this.storeLatestOffset(latestOffset.comitted, latestOffset.comitted)
+
+		this.finishSetup()
+	}
+
 	async fetch(request: Request): Promise<Response> {
+		this.streamName = new URL(request.url).pathname
+		if (!this.setup) {
+			await this.ensureSetup()
+		}
+
 		if (request.method === "POST") {
 			return this.handleProduce(request)
 		}
@@ -111,7 +195,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async flushPendingMessages() {
-		const pendingResponses = new Map<WebSocket, string>()
+		const offsets: string[][] = []
 		// TODO persist logs
 		// TODO persist latest offset with 2PC (with intended R2 segment write)
 		// TODO respond to the sockets with their new offsets
