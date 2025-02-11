@@ -187,7 +187,8 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 
 	async alarm(alarmInfo?: AlarmInvocationInfo) {
 		await this.flushPendingMessages()
-		// TODO: Check if we need to compact log segments
+		// TODO: Check if we need to compact log segments (random chance)
+		// TODO: Check if we need to tombstone (random chance)
 	}
 
 	async flushPendingMessages() {
