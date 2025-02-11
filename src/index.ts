@@ -4,14 +4,12 @@ import { generateLogSegmentName, parseLogSegmentName, SegmentMetadata } from "./
 import { RBTree } from "bintrees"
 
 const FlushIntervalMs = 200
-
-const consumerOffsetKeyPrefix = "consumer_offset::"
-
 const hour = 1000 * 60 * 60
 const day = hour * 24
+const MaxStaleSegmentMs = day * 1
 
+const consumerOffsetKeyPrefix = "consumer_offset::"
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
-const MaxStaleSegmentMs = day * 1 // 1 day
 
 function buildLogSegmentIndexKey(segmentName: string): string {
 	return `${activeLogSegmentKey}${segmentName}`
