@@ -6,14 +6,18 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "start": "wrangler dev",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "test": "vitest"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250204.0",
     "@types/bintrees": "^1.0.6",
     "@types/node": "^22.13.1",
+    "@types/ws": "^8.5.14",
     "typescript": "^5.5.2",
-    "wrangler": "^3.107.3"
+    "vitest": "^3.0.5",
+    "wrangler": "^3.107.3",
+    "ws": "^8.18.0"
   },
   "dependencies": {
     "bintrees": "^1.0.2"

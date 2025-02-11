@@ -119,6 +119,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		console.log("fetch", request.url)
 		if (!this.streamName) {
 			// Set it if we don't have it yet
 			this.streamName = new URL(request.url).pathname
@@ -315,6 +316,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
+		console.log("fetch", request.url)
 		let id = env.StreamCoordinator.idFromName(new URL(request.url).pathname)
 		let stub = env.StreamCoordinator.get(id)
 		return stub.fetch(request)
