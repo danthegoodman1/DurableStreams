@@ -1,9 +1,15 @@
 import { DurableObject } from "cloudflare:workers"
 import { EventEmitter } from "node:events"
+import { generateLogSegmentName, SegmentMetadata } from "./segment"
 
-const FlushIntervalMs = 100
+const hour = 1000 * 60 * 60
+const day = hour * 24
+
+const FlushIntervalMs = 200
+const MaxStaleSegmentMs = day * 1 // 1 day
 
 const latestOffsetKey = "_latest_offset"
+const activeLogSegmentKey = "_active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
 interface LatestOffset {
 	/**
@@ -32,6 +38,10 @@ function parseOffset(offset: string): [number, number] {
 function serializeOffset(epoch: number, counter: number): string {
 	// 16 digits is max safe integer for JS
 	return `${epoch.toString().padStart(16, "0")}:${counter.toString().padStart(16, "0")}`
+}
+
+function buildLogSegmentIndexKey(segmentName: string): string {
+	return `${activeLogSegmentKey}${segmentName}`
 }
 
 export class StreamCoordinator extends DurableObject<Env> {
@@ -229,6 +239,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 			this.epoch = oldEpoch + 1
 		}
 
+		const segmentName = generateLogSegmentName(this.epoch)
+
 		const offsets: string[][] = []
 		for (const message of this.pendingMessages) {
 			// For each of the writes, we need to generate an offset for each record
@@ -245,8 +257,16 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		// TODO persist logs
 		// TODO: - this is a whole ordeal with keeping track of what is merged and what's not via Kv storage?
-		// TODO persist latest offset with 2PC (with intended R2 segment write)
-		// TODO respond to the writers with their new offsets
+
+		// Write the log segment index
+		await this.ctx.storage.transaction(async (tx) => {
+			await this.writeLogSegmentIndex(tx, {
+				name: segmentName,
+				firstOffset: serializeOffset(this.epoch, this.counter),
+				lastOffset: serializeOffset(this.epoch, this.counter),
+				createdMS: Date.now(),
+			})
+		})
 	}
 
 	async writeLogSegment(segmentName: string, records: any[]) {
@@ -254,6 +274,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// TODO: each record is a new line, 33 bytes for the name, then the JSON record
 		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
 		const writer = writable.getWriter()
+
+		//
 
 		// start streaming the records to the file
 		// TODO: with the first segment
@@ -273,9 +295,19 @@ export class StreamCoordinator extends DurableObject<Env> {
 		await Promise.all([writer.close(), writePromise])
 	}
 
-	async compactLogSegments() {
+	async writeLogSegmentIndex(tx: DurableObjectTransaction, metadata: SegmentMetadata) {
+		await tx.put(buildLogSegmentIndexKey(metadata.name), JSON.stringify(metadata))
+	}
+
+	async compactLogSegments(segments: SegmentMetadata[]) {
 		// TODO: check metadata to see if we need to compact log segments
 		// TODO: k-way merge the segments with line readers
+		// TODO: transaction to update log segments
+	}
+
+	async cleanupLogSegments() {
+		// TODO: get snapshot of what segments are active
+		// TODO: if a non-active segment is older than the retention policy, delete it in transaction
 	}
 }
 
