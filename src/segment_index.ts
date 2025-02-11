@@ -41,10 +41,14 @@ export class SegmentIndex<Env = unknown> extends DurableObject<Env> {
 		})
 	}
 
-	async ensureSetup() {
-		const segments = await this.ctx.storage.list({
-			prefix: "log_segment::",
+	async buildIndexFromStorage() {
+		const segments = await this.ctx.storage.list<SegmentMetadata>({
+			prefix: activeLogSegmentKey,
 		})
+
+		for (const [_, segment] of segments) {
+			this.tree.insert(segment)
+		}
 	}
 
 	async writeLogSegmentIndex(tx: DurableObjectTransaction, metadata: SegmentMetadata) {

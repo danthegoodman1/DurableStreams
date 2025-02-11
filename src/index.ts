@@ -26,9 +26,9 @@ interface ProduceBody {
 	records: any[]
 }
 
-function parseOffset(offset: string): [number, number] {
+function parseOffset(offset: string): { epoch: number; counter: number } {
 	const [epoch, counter] = offset.split(":")
-	return [Number(epoch), Number(counter)]
+	return { epoch: Number(epoch), counter: Number(counter) }
 }
 
 function serializeOffset(epoch: number, counter: number): string {
@@ -64,14 +64,6 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		this.setup_listener!.emit("finish")
 	}
 
-	buildR2Key(epoch: Number) {
-		return `${this.streamName}/${epoch}`
-	}
-
-	async storeLatestOffset(latest: string, comitted: string) {
-		await this.ctx.storage.put(latestOffsetKey, JSON.stringify({ latest, comitted }))
-	}
-
 	/**
 	 * Ensures that we load the latest state from storage before we being processing requests
 	 */
@@ -88,42 +80,14 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		// We are the first instance to start up, so we need to do the setup
 		this.setup_listener = new EventEmitter<{ finish: [] }>()
 
-		// load the latest offset from storage
-		const latestOffset = await this.ctx.storage.get<LatestOffset>(latestOffsetKey)
-		if (!latestOffset) {
-			// This is a fresh instance
-			console.log("No offset found, must be a fresh instance")
-			this.finishSetup()
-			return
-		}
-		if (latestOffset.staged === latestOffset.comitted) {
-			// The offsets match, so we can finish setup
-			console.log("Offsets match, finishing setup")
-			this.finishSetup()
-			return
-		}
+		console.log("Building index from storage")
+		await this.buildIndexFromStorage()
 
-		// If the offsets don't match, check R2
-		console.warn("Offsets don't match, checking R2 to see if we committed")
-		// TODO: use the index to find where the offset is in the segment files
-		const segmentFile = await this.env.StreamData.get(this.buildR2Key(parseOffset(latestOffset.staged)[0]))
+		if (this.tree.size === 0) return this.finishSetup()
 
-		// Staged is always ahead of or the same as comitted, let's set the epoch as later we check to make sure we
-		// are not behind (we check later to make sure new writes use a later epoch)
-		const [stagedEpoch] = parseOffset(latestOffset.staged)
-		this.epoch = stagedEpoch
-
-		if (segmentFile) {
-			// We have a segment file, so we can implicitly commit the offset
-			console.log(`Segment file found, implicitly committing offset to staged offset: ${latestOffset.staged}`)
-			await this.storeLatestOffset(latestOffset.staged, latestOffset.staged)
-			this.finishSetup()
-			return
-		}
-
-		// Otherwise we died during the 2PC, so we need to truncate
-		console.warn(`No segment file found, truncating to last committed offset: ${latestOffset.comitted}`)
-		await this.storeLatestOffset(latestOffset.comitted, latestOffset.comitted)
+		// Load the previous epoch if we have it. When we go to write
+		// we'll increment this and handle clock drift
+		this.epoch = parseOffset(this.tree.max()!.lastOffset).epoch
 
 		this.finishSetup()
 	}
