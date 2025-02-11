@@ -238,8 +238,6 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
 		const writer = writable.getWriter()
 
-		//
-
 		// start streaming the records to the file
 		// TODO: with the first segment
 		// TODO: With the correct key that's to be stored in the index
@@ -264,7 +262,7 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		// TODO: transaction to update log segments
 	}
 
-	async cleanupLogSegments() {
+	async cleanTombstones() {
 		// TODO: get snapshot of what segments are active
 		// TODO: list R2 to find non-active segments that are older than the retention policy
 		// TODO: delete the segments from R2
