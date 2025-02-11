@@ -307,7 +307,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 	async cleanupLogSegments() {
 		// TODO: get snapshot of what segments are active
-		// TODO: if a non-active segment is older than the retention policy, delete it in transaction
+		// TODO: list R2 to find non-active segments that are older than the retention policy
+		// TODO: delete the segments from R2
 	}
 }
 
