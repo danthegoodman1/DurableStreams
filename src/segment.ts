@@ -1,5 +1,3 @@
-export const logSegmentKeyPrefix = "log_segment::"
-
 export interface SegmentMetadata {
 	firstOffset: string
 	lastOffset: string
@@ -37,6 +35,12 @@ export async function* readLines(stream: ReadableStream<Uint8Array>) {
 	}
 }
 
-export function generateLogSegmentName(epoch: number) {
-	return `${logSegmentKeyPrefix}${epoch}:${crypto.randomUUID()}`
+export function generateLogSegmentName(stream: string, epoch: number) {
+	return `${stream}/${epoch}:${crypto.randomUUID()}.seg`
+}
+
+export function parseLogSegmentName(name: string): { stream: string; epoch: number; uuid: string } {
+	const [stream, parts] = name.split("/")
+	const [epoch, uuid] = parts.split(".")[0].split(":")
+	return { stream, epoch: Number(epoch), uuid }
 }

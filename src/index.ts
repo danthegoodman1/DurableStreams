@@ -1,6 +1,5 @@
-import { DurableObject } from "cloudflare:workers"
 import { EventEmitter } from "node:events"
-import { generateLogSegmentName, SegmentMetadata } from "./segment"
+import { generateLogSegmentName, parseLogSegmentName, SegmentMetadata } from "./segment"
 import { SegmentIndex } from "./segment_index"
 
 const FlushIntervalMs = 200
@@ -87,13 +86,20 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 
 		// Load the previous epoch if we have it. When we go to write
 		// we'll increment this and handle clock drift
-		this.epoch = parseOffset(this.tree.max()!.lastOffset).epoch
+		const maxRecord = this.tree.max()!
+		this.epoch = parseOffset(maxRecord.lastOffset).epoch
+		const { stream } = parseLogSegmentName(maxRecord.name)
+		this.streamName = stream
 
 		this.finishSetup()
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		this.streamName = new URL(request.url).pathname
+		if (!this.streamName) {
+			// Set it if we don't have it yet
+			this.streamName = new URL(request.url).pathname
+		}
+
 		if (!this.setup) {
 			await this.ensureSetup()
 		}
@@ -195,7 +201,7 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 			this.epoch = oldEpoch + 1
 		}
 
-		const segmentName = generateLogSegmentName(this.epoch)
+		const segmentName = generateLogSegmentName(this.streamName, this.epoch)
 
 		const offsets: string[][] = []
 		for (const message of this.pendingMessages) {
