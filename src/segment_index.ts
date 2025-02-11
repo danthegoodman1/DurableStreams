@@ -5,7 +5,7 @@ import { SegmentMetadata } from "./segment"
 const hour = 1000 * 60 * 60
 const day = hour * 24
 
-const activeLogSegmentKey = "_active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
+const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 const MaxStaleSegmentMs = day * 1 // 1 day
 
 function buildLogSegmentIndexKey(segmentName: string): string {

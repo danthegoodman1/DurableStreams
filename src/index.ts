@@ -5,7 +5,7 @@ import { SegmentIndex } from "./segment_index"
 
 const FlushIntervalMs = 200
 
-const latestOffsetKey = "_latest_offset"
+const consumerOffsetKeyPrefix = "consumer_offset::"
 
 interface LatestOffset {
 	/**
