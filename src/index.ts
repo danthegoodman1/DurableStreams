@@ -1,15 +1,11 @@
 import { DurableObject } from "cloudflare:workers"
 import { EventEmitter } from "node:events"
 import { generateLogSegmentName, SegmentMetadata } from "./segment"
-
-const hour = 1000 * 60 * 60
-const day = hour * 24
+import { SegmentIndex } from "./segment_index"
 
 const FlushIntervalMs = 200
-const MaxStaleSegmentMs = day * 1 // 1 day
 
 const latestOffsetKey = "_latest_offset"
-const activeLogSegmentKey = "_active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
 interface LatestOffset {
 	/**
@@ -40,11 +36,7 @@ function serializeOffset(epoch: number, counter: number): string {
 	return `${epoch.toString().padStart(16, "0")}:${counter.toString().padStart(16, "0")}`
 }
 
-function buildLogSegmentIndexKey(segmentName: string): string {
-	return `${activeLogSegmentKey}${segmentName}`
-}
-
-export class StreamCoordinator extends DurableObject<Env> {
+export class StreamCoordinator extends SegmentIndex<Env> {
 	connectedWebsockets: number = 0
 	consumers: Map<WebSocket, string> = new Map()
 	consumerOffsets: Map<string, string> = new Map()
@@ -293,10 +285,6 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		await Promise.all([writer.close(), writePromise])
-	}
-
-	async writeLogSegmentIndex(tx: DurableObjectTransaction, metadata: SegmentMetadata) {
-		await tx.put(buildLogSegmentIndexKey(metadata.name), JSON.stringify(metadata))
 	}
 
 	async compactLogSegments(segments: SegmentMetadata[]) {
