@@ -210,7 +210,7 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		}
 
 		// Write the pending messages to the log segment
-		await this.writePendingMessages(segmentName, offsets, this.pendingMessages)
+		await this.writePendingMessagesToLogSegment(segmentName, offsets, this.pendingMessages)
 
 		// Write the log segment index so we actually persist the segment
 		await this.ctx.storage.transaction(async (tx) => {
@@ -223,7 +223,7 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		})
 	}
 
-	async writePendingMessages(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
+	async writePendingMessagesToLogSegment(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
 		// write the segment to R2, named after the first record in the segment
 		// each record is a new line, 32 bytes for the name, then the JSON record
 		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
