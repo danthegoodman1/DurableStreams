@@ -6,15 +6,9 @@ const FlushIntervalMs = 200
 
 const consumerOffsetKeyPrefix = "consumer_offset::"
 
-interface LatestOffset {
-	/**
-	 * The latest offset that has been staged for persistence
-	 */
-	staged: string
-	/**
-	 * The latest offset that has been comitted to R2
-	 */
-	comitted: string
+interface PendingMessage {
+	emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
+	records: any[]
 }
 
 interface AckRPC {
@@ -32,7 +26,7 @@ function parseOffset(offset: string): { epoch: number; counter: number } {
 
 function serializeOffset(epoch: number, counter: number): string {
 	// 16 digits is max safe integer for JS
-	return `${epoch.toString().padStart(16, "0")}:${counter.toString().padStart(16, "0")}`
+	return `${epoch.toString().padStart(16, "0")}${counter.toString().padStart(16, "0")}`
 }
 
 export class StreamCoordinator extends SegmentIndex<Env> {
@@ -46,10 +40,7 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 	counter: number = 0
 
 	// Messages that are pending persistence in the flush interval
-	pendingMessages: Set<{
-		emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
-		records: any[]
-	}> = new Set()
+	pendingMessages: PendingMessage[] = []
 
 	setup_listener?: EventEmitter<{ finish: [] }>
 	setup = false
@@ -134,8 +125,8 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 
 		// Submit for persistence and wait
 		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
-		this.pendingMessages.add({ emitter, records: body.records })
-		if (this.pendingMessages.size === 1) {
+		this.pendingMessages.push({ emitter, records: body.records })
+		if (this.pendingMessages.length === 1) {
 			// Set the alarm to flush the pending messages
 			await this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
 		}
@@ -218,10 +209,10 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 			offsets.push(messageOffsets)
 		}
 
-		// TODO persist logs
-		// TODO: - this is a whole ordeal with keeping track of what is merged and what's not via Kv storage?
+		// Write the pending messages to the log segment
+		await this.writePendingMessages(segmentName, offsets, this.pendingMessages)
 
-		// Write the log segment index
+		// Write the log segment index so we actually persist the segment
 		await this.ctx.storage.transaction(async (tx) => {
 			await this.writeLogSegmentIndex(tx, {
 				name: segmentName,
@@ -232,28 +223,31 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		})
 	}
 
-	async writeLogSegment(segmentName: string, records: any[]) {
-		// TODO: write the segment to R2, named after the first record in the segment
-		// TODO: each record is a new line, 33 bytes for the name, then the JSON record
+	async writePendingMessages(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
+		// write the segment to R2, named after the first record in the segment
+		// each record is a new line, 32 bytes for the name, then the JSON record
 		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
 		const writer = writable.getWriter()
 
 		// start streaming the records to the file
-		// TODO: with the first segment
-		// TODO: With the correct key that's to be stored in the index
 		const writePromise = this.env.StreamData.put(segmentName, readable)
 
-		// TODO: write the records to the stream
-		for (const record of records) {
-			const name = record.name // TODO: fix this
-			const json = JSON.stringify(record)
-			const nameBuffer = new TextEncoder().encode(name)
-			const jsonBuffer = new TextEncoder().encode(json)
-			writer.write(nameBuffer)
-			writer.write(jsonBuffer)
+		// Write the records to the file
+		let records = 0
+		for (let i = 0; i < pendingMessages.length; i++) {
+			for (let j = 0; j < pendingMessages[i].records.length; j++) {
+				const name = offsets[i][j]
+				const json = JSON.stringify(pendingMessages[i].records[j])
+				const nameBuffer = new TextEncoder().encode(name)
+				const jsonBuffer = new TextEncoder().encode(json)
+				writer.write(nameBuffer)
+				writer.write(jsonBuffer)
+				records++
+			}
 		}
 
 		await Promise.all([writer.close(), writePromise])
+		console.log(`Wrote ${records} records to ${segmentName}`)
 	}
 
 	async compactLogSegments(segments: SegmentMetadata[]) {
