@@ -2,6 +2,10 @@ export interface SegmentMetadata {
 	firstOffset: string
 	lastOffset: string
 	createdMS: number
+	/**
+	 * An optimization to stop the common stream name prefix from being stored
+	 * multiple times in the index, however this should never be that large.
+	 */
 	name: string
 }
 
