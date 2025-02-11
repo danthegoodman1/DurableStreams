@@ -51,7 +51,10 @@ export class SegmentIndex<Env = unknown> extends DurableObject<Env> {
 		}
 	}
 
-	async writeLogSegmentIndex(tx: DurableObjectTransaction, metadata: SegmentMetadata) {
-		await tx.put(buildLogSegmentIndexKey(metadata.name), JSON.stringify(metadata))
+	async writeLogSegmentMetadata(metadata: SegmentMetadata) {
+		// First we need to durably store it
+		await this.ctx.storage.put(buildLogSegmentIndexKey(metadata.name), JSON.stringify(metadata))
+		// Then we can add it to the memory index
+		this.tree.insert(metadata)
 	}
 }

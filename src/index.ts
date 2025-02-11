@@ -213,14 +213,14 @@ export class StreamCoordinator extends SegmentIndex<Env> {
 		await this.writePendingMessagesToLogSegment(segmentName, offsets, this.pendingMessages)
 
 		// Write the log segment index so we actually persist the segment
-		await this.ctx.storage.transaction(async (tx) => {
-			await this.writeLogSegmentIndex(tx, {
-				name: segmentName,
-				firstOffset: serializeOffset(this.epoch, this.counter),
-				lastOffset: serializeOffset(this.epoch, this.counter),
-				createdMS: Date.now(),
-			})
+		await this.writeLogSegmentMetadata({
+			name: segmentName,
+			firstOffset: serializeOffset(this.epoch, this.counter),
+			lastOffset: serializeOffset(this.epoch, this.counter),
+			createdMS: Date.now(),
 		})
+
+		// TODO: push logs to consumers
 	}
 
 	async writePendingMessagesToLogSegment(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
