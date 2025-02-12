@@ -17,7 +17,10 @@ function buildLogSegmentIndexKey(segmentName: string): string {
 
 interface PendingMessage {
 	emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
-	records: any[]
+	/**
+	 * Pre-serialized records so we can pre-calculate the length of write streams
+	 */
+	records: string[]
 }
 
 interface AckRPC {
@@ -106,7 +109,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 		console.log("Building index from storage")
 		await this.buildIndexFromStorage()
 
-		if (this.tree.size === 0) return this.finishSetup()
+		if (this.tree.size === 0) {
+			console.debug("No segments found, skipping setup")
+			return this.finishSetup()
+		}
 
 		// Load the previous epoch if we have it. When we go to write
 		// we'll increment this and handle clock drift
@@ -114,12 +120,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 		this.epoch = parseOffset(maxRecord.lastOffset).epoch
 		const { stream } = parseLogSegmentName(maxRecord.name)
 		this.streamName = stream
+		console.debug(`Setup complete, epoch: ${this.epoch}, streamName: ${this.streamName}`)
 
 		this.finishSetup()
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		console.log("fetch", request.url)
 		if (!this.streamName) {
 			// Set it if we don't have it yet
 			this.streamName = new URL(request.url).pathname
@@ -159,11 +165,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		// Submit for persistence and wait
 		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
-		this.pendingMessages.push({ emitter, records: body.records })
+		this.pendingMessages.push({ emitter, records: body.records.map((r) => JSON.stringify(r)) })
 		if (this.pendingMessages.length === 1) {
 			// Set the alarm to flush the pending messages
 			await this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
 		}
+		console.debug("waiting for flush")
 		const offsetOrError = await Promise.any([
 			new Promise<string[]>((resolve) => emitter.once("resolve", resolve)),
 			new Promise<Error>((resolve) => emitter.once("error", resolve)),
@@ -211,12 +218,14 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async alarm(alarmInfo?: AlarmInvocationInfo) {
+		console.debug("alarm waking up")
 		await this.flushPendingMessages()
 		// TODO: Check if we need to compact log segments (random chance, increasing with segment index size)
 		// TODO: Check if we need to tombstone (random chance)
 	}
 
 	async flushPendingMessages() {
+		console.debug("flushing pending messages")
 		// Increment the epoch and reset the counter
 		const oldEpoch = this.epoch
 		this.epoch = Date.now()
@@ -244,9 +253,11 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		// Write the pending messages to the log segment
+		console.debug("writing pending messages to log segment")
 		await this.writePendingMessagesToLogSegment(segmentName, offsets, this.pendingMessages)
 
 		// Write the log segment index so we actually persist the segment
+		console.debug("writing log segment metadata")
 		await this.writeLogSegmentMetadata({
 			name: segmentName,
 			firstOffset: serializeOffset(this.epoch, this.counter),
@@ -254,32 +265,48 @@ export class StreamCoordinator extends DurableObject<Env> {
 			createdMS: Date.now(),
 		})
 
+		// Notify producer emitters to return
+		for (let i = 0; i < this.pendingMessages.length; i++) {
+			this.pendingMessages[i].emitter.emit("resolve", offsets[i])
+		}
+
+		// Clear the pending messages
+		this.pendingMessages = []
+
 		// TODO: push logs to consumers
+		console.debug("pushing logs to consumers")
 	}
 
 	async writePendingMessagesToLogSegment(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
-		// write the segment to R2, named after the first record in the segment
-		// each record is a new line, 32 bytes for the name, then the JSON record
-		const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
+		// Calculate the total overhead: 33 bytes per record (32 bytes for the offset name + 1 byte for the newline)
+		const totalOverhead = pendingMessages.reduce((acc, m) => acc + m.records.length, 0) * 33
+		// Sum of lengths of all the JSON record strings
+		const totalRecordsLength = pendingMessages.reduce((acc, m) => acc + m.records.reduce((acc, r) => acc + r.length, 0), 0)
+		const totalLength = totalOverhead + totalRecordsLength
+
+		const { readable, writable } = new FixedLengthStream(totalLength)
 		const writer = writable.getWriter()
 
-		// start streaming the records to the file
+		// Start streaming the records to the file
 		const writePromise = this.env.StreamData.put(segmentName, readable)
 
 		// Write the records to the file
 		let records = 0
+		let actualLength = 0
 		for (let i = 0; i < pendingMessages.length; i++) {
 			for (let j = 0; j < pendingMessages[i].records.length; j++) {
 				const name = offsets[i][j]
-				const json = JSON.stringify(pendingMessages[i].records[j])
 				const nameBuffer = new TextEncoder().encode(name)
-				const jsonBuffer = new TextEncoder().encode(json)
+				const jsonBuffer = new TextEncoder().encode(pendingMessages[i].records[j])
 				writer.write(nameBuffer)
 				writer.write(jsonBuffer)
+				writer.write(new TextEncoder().encode("\n"))
+				actualLength += nameBuffer.length + jsonBuffer.length + 1
 				records++
 			}
 		}
 
+		console.debug(`Writing ${records} records to ${segmentName} with actual length ${actualLength} and expected length ${totalLength}`)
 		await Promise.all([writer.close(), writePromise])
 		console.log(`Wrote ${records} records to ${segmentName}`)
 	}

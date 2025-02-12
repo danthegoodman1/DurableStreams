@@ -18,14 +18,24 @@ describe("Worker", () => {
 
 	describe("durable object", () => {
 		it("should create a new stream and produce messages", async () => {
-			const streamName = "test"
+			const streamName = crypto.randomUUID()
 			// Create the stream with a post request
 			const resp = await worker.fetch(`http://example.com/${streamName}`, {
 				method: "POST",
 				body: JSON.stringify({
-					records: [{ value: "hello" }],
+					records: [
+						{ value: "hello" },
+						{ value: "world" },
+						{ value: "world" },
+						{ value: "world" },
+						{ value: "world" },
+						{ value: "world" },
+						{ value: "world" },
+						{ value: "world" },
+					],
 				}),
 			})
+			console.log(await resp.text())
 			expect(resp.status).toBe(200)
 		})
 	})
