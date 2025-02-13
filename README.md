@@ -35,6 +35,6 @@ If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer tha
 
 Yes. That's effectively what streams are. Sometimes they have extra features like managed consumer groups too :P
 
-### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/) but NDJSON, if you're having consumers track their own offsets
+### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets?
 
 ... next question
