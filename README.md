@@ -1,5 +1,13 @@
 # DurableStreams
 
+## Difference from Workers PubSub and Workers Queues
+
+It's a funadamentally different model, that same reason you'd use Kafka over RabbitMQ or Redis list: Streams are immutable, ordered, and consumers can pull them when ever.
+
+PubSub doesn't hold an infinite history, and queues don't let consumers operate in full isolation (nor have infinite history).
+
+You need streams if you want a log that can persist for long durations, and handle starting consuming from 3 months ago.
+
 ## Differences from Kafka-like systems
 
 ### Publish is not socketed
