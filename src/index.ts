@@ -23,8 +23,14 @@ interface PendingMessage {
 	records: string[]
 }
 
-interface AckRPC {
-	offset: string
+interface WebSocketRPC {
+	method: string
+}
+
+interface GetMessagesRPC extends WebSocketRPC {
+	method: "get_messages"
+	after_offset?: string
+	limit?: number
 }
 
 interface ProduceBody {
@@ -44,7 +50,6 @@ function serializeOffset(epoch: number, counter: number): string {
 export class StreamCoordinator extends DurableObject<Env> {
 	connectedWebsockets: number = 0
 	consumers: Map<WebSocket, string> = new Map()
-	consumerOffsets: Map<string, string> = new Map()
 
 	lastOffset: string = ""
 	streamName: string = ""
@@ -126,6 +131,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		console.log("fetch", request.url, request.method)
 		if (!this.streamName) {
 			// Set it if we don't have it yet
 			this.streamName = new URL(request.url).pathname
@@ -139,13 +145,13 @@ export class StreamCoordinator extends DurableObject<Env> {
 			return this.handleProduce(request)
 		}
 
+		console.debug("detected potential websocket connection")
+
 		const url = new URL(request.url)
 		const consumerID = url.searchParams.get("consumer_id")
 		if (!consumerID) {
 			return new Response("Missing consumer_id query parameter", { status: 400 })
 		}
-		const fromOffset = url.searchParams.get("from_offset")
-		this.consumerOffsets.set(consumerID, fromOffset || "")
 
 		const webSocketPair = new WebSocketPair()
 		const [client, server] = Object.values(webSocketPair)
@@ -189,7 +195,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-		let params: AckRPC
+		let params: WebSocketRPC
 		try {
 			params = JSON.parse(message.toString())
 		} catch (error) {
@@ -197,7 +203,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 			return
 		}
 
-		this.handleAck(ws, params)
+		switch (params.method) {
+			case "get_messages":
+				await this.handleGetMessages(ws, params as GetMessagesRPC)
+				break
+				break
+		}
 	}
 
 	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
@@ -207,8 +218,14 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 	async webSocketError(ws: WebSocket, error: unknown) {}
 
-	async handleAck(ws: WebSocket, params: AckRPC) {
-		// TODO persist the ack if it's forward of where it currently is (if exists)
+	async handleGetMessages(ws: WebSocket, params: GetMessagesRPC) {
+		const consumerID = this.consumers.get(ws)
+		if (!consumerID) {
+			console.error("No consumer ID found for WebSocket")
+			return
+		}
+
+		// TODO: stream messages to the consumer
 	}
 
 	async onConsumerConnect(ws: WebSocket, consumerID: string) {
@@ -252,6 +269,9 @@ export class StreamCoordinator extends DurableObject<Env> {
 			offsets.push(messageOffsets)
 		}
 
+		const oldLastOffset = this.lastOffset
+		this.lastOffset = offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1]
+
 		// Write the pending messages to the log segment
 		console.debug("writing pending messages to log segment")
 		await this.writePendingMessagesToLogSegment(segmentName, offsets, this.pendingMessages)
@@ -273,8 +293,16 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// Clear the pending messages
 		this.pendingMessages = []
 
-		// TODO: push logs to consumers
-		console.debug("pushing logs to consumers")
+		// poke all of the consumers to get new messages
+		console.debug("poking consumers to get new messages")
+		for (const ws of this.consumers.keys()) {
+			ws.send(
+				JSON.stringify({
+					event: "new_offset",
+					offset: this.lastOffset,
+				})
+			)
+		}
 	}
 
 	async writePendingMessagesToLogSegment(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
