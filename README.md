@@ -28,3 +28,13 @@ The decision to not support groups is in 2:
 2. A single DO probably won't have the bandwidth such that multiple groups are even needed
 
 If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer that manages fanning them out. Or do something like simple like each consumer only actually processes `Murmur3(offset) % N`.
+
+## Other notes
+
+### Isn't this just effectively a batching NDJSON merge engine, with a monotonic hybrid clock?
+
+Yes. That's effectively what streams are. Sometimes they have extra features like managed consumer groups too :P
+
+### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/) but NDJSON, if you're having consumers track their own offsets
+
+... next question
