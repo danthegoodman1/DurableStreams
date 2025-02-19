@@ -15,7 +15,7 @@ function buildLogSegmentIndexKey(segmentName: string): string {
 	return `${activeLogSegmentKey}${segmentName}`
 }
 
-interface PendingMessage {
+export interface PendingMessage {
 	emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
 	/**
 	 * Pre-serialized records so we can pre-calculate the length of write streams
@@ -23,27 +23,31 @@ interface PendingMessage {
 	records: string[]
 }
 
-interface GetMessagesRequest {
+export interface GetMessagesRequest {
 	consumerID: string
 
-	// "" means we long poll until a new message comes in
+	// "" (or the same offset as the last message) means we long poll until a new message comes in, "-" means we start from the first offset
 	offset: string
 	limit: number
 	// only used for long polling
 	timeout_sec: number
 }
 
-interface GetMessagesResponse {
+export interface GetMessagesResponse {
 	records: Record[]
 }
 
-interface Record {
+export interface Record {
 	offset: string
 	data: any
 }
 
-interface ProduceBody {
+export interface ProduceBody {
 	records: any[]
+}
+
+export interface ProduceResponse {
+	offsets: string[][]
 }
 
 function parseOffset(offset: string): { epoch: number; counter: number } {
