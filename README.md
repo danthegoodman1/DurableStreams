@@ -39,4 +39,4 @@ Yes. That's effectively what streams are. Sometimes they have extra features lik
 
 ### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets, and you added a clock for ordering?
 
-Kinda, that's why I was able to make it in 500 loc in <10hrs of dev work
+Kinda, that's why I was able to make it in <1000 loc and <10hrs of dev work
