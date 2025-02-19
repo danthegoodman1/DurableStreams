@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events"
 import { DurableObject } from "cloudflare:workers"
-import { generateLogSegmentName, parseLogSegmentName, SegmentMetadata } from "./segment"
+import { generateLogSegmentName, parseLogSegmentName, readLines, SegmentMetadata } from "./segment"
 import { RBTree } from "bintrees"
 
 const FlushIntervalMs = 200
@@ -51,7 +51,8 @@ export interface ProduceResponse {
 }
 
 function parseOffset(offset: string): { epoch: number; counter: number } {
-	const [epoch, counter] = offset.split(":")
+	const epoch = offset.slice(0, 16)
+	const counter = offset.slice(16)
 	return { epoch: Number(epoch), counter: Number(counter) }
 }
 
@@ -170,7 +171,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		const payload: GetMessagesRequest = {
 			consumerID,
 			offset: offset ?? "",
-			limit: Number(limit) ?? 100,
+			limit: Number(limit) ?? 10, // low default avoid OOM
 			timeout_sec: Number(timeout_sec) ?? 10,
 		}
 
@@ -233,7 +234,55 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async getMessagesFromOffset(offset: string, limit: number): Promise<Record[]> {
-		// TODO: get messages from the offset up to limit
+		// get the item from the tree that's below the offset
+		const segment = getFloorSegment(this.tree, offset)
+		if (!segment) {
+			// We didn't find a segment that contains the offset, so we return an empty array
+			return []
+		}
+
+		// verify the offset is in the range
+		if (segment.firstOffset > offset || segment.lastOffset < offset) {
+			// The offset is outside the range, this is a bug
+			console.error("Offset is outside the range of the segment", offset, segment)
+			return []
+		}
+
+		// Load the segment from R2
+		const segmentData = await this.env.StreamData.get(segment.name)
+		if (!segmentData) {
+			// The segment doesn't exist, this is a bug
+			console.error("Segment does not exist", segment)
+			return []
+		}
+
+		// Stream the records from the segment up to limit
+		const records: Record[] = []
+		for await (const line of readLines(segmentData.body)) {
+			const [recordOffset, data] = line.split("\t", 2)
+			if (recordOffset >= offset) {
+				let jsonData: any
+				try {
+					jsonData = JSON.parse(data.slice(32, data.length - 1)) // get 32:-1 to remove the offset and newline
+				} catch (e) {
+					// This is a bug, the segment is corrupt
+					throw Error(`Error parsing record (is the segment corrupt?): ${e}`)
+				}
+
+				records.push({ offset: recordOffset, data: jsonData })
+				if (records.length >= limit) {
+					break
+				}
+			}
+		}
+
+		// if we didn't hit the limit, repeat from the new offset (last record we streamed)
+		if (records.length < limit) {
+			console.debug(`getting more messages from offset ${records[records.length - 1].offset}`)
+			records.push(...(await this.getMessagesFromOffset(records[records.length - 1].offset, limit - records.length)))
+		}
+
+		return records
 	}
 
 	async alarm(alarmInfo?: AlarmInvocationInfo) {
@@ -364,6 +413,38 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// TODO: list R2 to find non-active segments that are older than the retention policy
 		// TODO: delete the segments from R2
 	}
+}
+
+// This helper function returns the floor SegmentMetadata, i.e. the record
+// whose firstOffset is the largest value that is <= the given offset.
+// It returns null if no such record exists.
+function getFloorSegment(tree: RBTree<SegmentMetadata>, offset: string): SegmentMetadata | null {
+	// Create a dummy object with the search key.
+	const searchKey = { firstOffset: offset } as SegmentMetadata
+
+	// Find the first element that is >= searchKey
+	const it = tree.lowerBound(searchKey)
+
+	// If the iterator returns null, then either the tree is empty
+	// or (depending on the implementation) the offset is greater than all elements.
+	if (it.data() === null) {
+		// If the tree isn't empty, the floor is the maximum element.
+		return tree.max()
+	}
+
+	// If the found record exactly matches the offset, return it.
+	if (it.data()!.firstOffset === offset) {
+		return it.data()
+	}
+
+	// Otherwise, lowerBound returned the smallest record > offset.
+	// Get its predecessor: the largest record < offset.
+	const pred = it.prev()
+	if (pred === null) {
+		return null
+	}
+
+	return pred
 }
 
 export default {
