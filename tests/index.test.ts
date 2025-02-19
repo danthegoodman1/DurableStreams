@@ -93,19 +93,23 @@ describe("Worker", () => {
 			expect(produceData.offsets).toBeDefined()
 
 			// Extract the offset of the second record in the batch. (produceData.offsets is an array of arrays.)
-			const secondOffset = produceData.offsets[0][1]
+			const firstOffset = produceData.offsets[0]
+
+			console.log(`getting from offset: ${firstOffset}`)
 
 			// Get messages starting from the extracted offset, limiting to 2 messages.
 			const consumerResponse = await worker.fetch(
-				`http://example.com/${streamName}?consumer_id=consumerOffset&offset=${secondOffset}&limit=1&timeout_sec=10`
+				`http://example.com/${streamName}?consumer_id=consumerOffset&offset=${firstOffset}&limit=1&timeout_sec=10`
 			)
 			expect(consumerResponse.status).toBe(200)
 			const consumerData = (await consumerResponse.json()) as GetMessagesResponse
 			expect(Array.isArray(consumerData.records)).toBe(true)
 			expect(consumerData.records.length).toBeLessThanOrEqual(1)
+			console.log(`consumerData: ${JSON.stringify(consumerData)}`)
 			if (consumerData.records.length > 0) {
 				expect(consumerData.records[0]).toHaveProperty("offset")
 				expect(consumerData.records[0]).toHaveProperty("data")
+				expect(consumerData.records[0].data.value).toBe("second")
 			}
 		})
 

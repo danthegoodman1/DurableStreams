@@ -8,7 +8,6 @@ const hour = 1000 * 60 * 60
 const day = hour * 24
 const MaxStaleSegmentMs = day * 1
 
-const consumerOffsetKeyPrefix = "consumer_offset::"
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
 function buildLogSegmentIndexKey(segmentName: string): string {
@@ -97,8 +96,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 				return 1
 			}
 
-			// should we crash here?
-			console.error("2 segments with intersecting offset ranges - this is a consistency bug", a, b)
+			// They are the same segment (search key)
 			return 0
 		})
 	}
@@ -214,12 +212,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 			})
 		}
 
-		// Otherwise we wait for new messages to come in
+		// For long polling, capture the current lastOffset as the starting point.
 		const emitter = new EventEmitter<{ records: [Record[]] }>()
 		this.consumers.set(payload.consumerID, { emitter, limit: payload.limit })
 		const res = await Promise.race([
 			new Promise<Record[]>((resolve) => emitter.once("records", resolve)),
-			new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("timeout")), payload.timeout_sec * 1000)), // timeout 10s
+			new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("timeout")), payload.timeout_sec * 1000)), // timeout after timeout_sec seconds
 		])
 
 		if (res instanceof Error) {
@@ -235,9 +233,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 	async getMessagesFromOffset(offset: string, limit: number): Promise<Record[]> {
 		// get the item from the tree that's below the offset
-		const segment = getFloorSegment(this.tree, offset)
+		const segment = getSegmentAfterOffset(this.tree, offset)
 		if (!segment) {
 			// We didn't find a segment that contains the offset, so we return an empty array
+			console.debug(`no messages segment found for offset ${offset}`)
 			return []
 		}
 
@@ -259,11 +258,14 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// Stream the records from the segment up to limit
 		const records: Record[] = []
 		for await (const line of readLines(segmentData.body)) {
-			const [recordOffset, data] = line.split("\t", 2)
-			if (recordOffset >= offset) {
+			console.debug(`reading line ${line}`)
+			const recordOffset = line.slice(0, 32)
+			const data = line.slice(32)
+			if (recordOffset > offset) {
 				let jsonData: any
 				try {
-					jsonData = JSON.parse(data.slice(32, data.length - 1)) // get 32:-1 to remove the offset and newline
+					console.debug(`parsing record ${data}`)
+					jsonData = JSON.parse(data) // get 32:-1 to remove the offset and newline
 				} catch (e) {
 					// This is a bug, the segment is corrupt
 					throw Error(`Error parsing record (is the segment corrupt?): ${e}`)
@@ -326,12 +328,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 		console.debug("writing pending messages to log segment")
 		await this.writePendingMessagesToLogSegment(segmentName, offsets, this.pendingMessages)
 
-		// Write the log segment index so we actually persist the segment
+		// Write the log segment metadata so the segment is persisted
 		console.debug("writing log segment metadata")
 		await this.writeLogSegmentMetadata({
 			name: segmentName,
-			firstOffset: serializeOffset(this.epoch, this.counter),
-			lastOffset: serializeOffset(this.epoch, this.counter),
+			firstOffset: offsets[0][0],
+			lastOffset: offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1],
 			createdMS: Date.now(),
 		})
 
@@ -343,11 +345,17 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// Clear the pending messages
 		this.pendingMessages = []
 
-		// poke all of the consumers to get new messages
+		// Send records to waiting consumers
 		console.debug("poking consumers to get new messages")
-		for (const emitter of this.consumers.keys()) {
-			// emitter.emit("records", records)
-			// TODO: emit records up to limit for the listener
+		for (const [consumerID, consumer] of this.consumers.entries()) {
+			console.debug(`getting messages from offset ${offsets[0][0]} for consumer ${consumerID}`)
+			const records = await this.getMessagesFromOffset(offsets[0][0], consumer.limit)
+			console.debug(`got ${records.length} records for consumer ${consumerID}`)
+			if (records.length > 0) {
+				console.debug(`emitting ${records.length} records to consumer ${consumerID}`)
+				consumer.emitter.emit("records", records)
+				this.consumers.delete(consumerID)
+			}
 		}
 	}
 
@@ -415,36 +423,46 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 }
 
-// This helper function returns the floor SegmentMetadata, i.e. the record
-// whose firstOffset is the largest value that is <= the given offset.
-// It returns null if no such record exists.
-function getFloorSegment(tree: RBTree<SegmentMetadata>, offset: string): SegmentMetadata | null {
-	// Create a dummy object with the search key.
+// This helper function returns the SegmentMetadata that will contain the first offset AFTER the given offset
+function getSegmentAfterOffset(tree: RBTree<SegmentMetadata>, offset: string): SegmentMetadata | null {
+	// Create a dummy search key with the provided offset.
 	const searchKey = { firstOffset: offset } as SegmentMetadata
 
-	// Find the first element that is >= searchKey
+	// Use the tree's lowerBound to find the first element whose firstOffset is >= offset.
 	const it = tree.lowerBound(searchKey)
+	let candidate: SegmentMetadata | null = null
 
-	// If the iterator returns null, then either the tree is empty
-	// or (depending on the implementation) the offset is greater than all elements.
+	// If lowerBound doesn't return an element, the tree may be empty or the offset is greater than all segments.
 	if (it.data() === null) {
-		// If the tree isn't empty, the floor is the maximum element.
-		return tree.max()
+		console.debug(`no lower bound segment found for offset ${offset}`)
+		candidate = tree.max()
+	} else {
+		// If the found element exactly matches the offset, then that's our candidate.
+		if (it.data()!.firstOffset === offset) {
+			console.debug(`found exact segment ${it.data()!.name} for offset ${offset}`)
+			candidate = it.data()
+		} else {
+			// Otherwise, lowerBound returned the smallest element with firstOffset > offset.
+			// The candidate is the predecessor (largest segment with firstOffset less than offset).
+			const pred = it.prev()
+			if (pred === null) {
+				console.debug(`no predecessor found for offset ${offset}`)
+				candidate = null
+			} else {
+				console.debug(`found predecessor ${pred.name} for offset ${offset}`)
+				candidate = pred
+			}
+		}
 	}
 
-	// If the found record exactly matches the offset, return it.
-	if (it.data()!.firstOffset === offset) {
-		return it.data()
+	// Verify the candidate's last offset is greater than the offset (single record segment)
+	if (candidate && candidate.lastOffset > offset) {
+		console.debug(`found segment ${candidate.name} covering offset ${offset}`)
+		return candidate
 	}
 
-	// Otherwise, lowerBound returned the smallest record > offset.
-	// Get its predecessor: the largest record < offset.
-	const pred = it.prev()
-	if (pred === null) {
-		return null
-	}
-
-	return pred
+	console.debug(`no segment covering offset ${offset} was found`)
+	return null
 }
 
 export default {
