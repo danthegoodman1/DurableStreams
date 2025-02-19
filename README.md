@@ -10,6 +10,8 @@ You need streams if you want a log that can persist for long durations, and hand
 
 ## Differences from Kafka-like systems
 
+It's more like Redis streams, without the consumer group.
+
 ### Publish is not socketed
 
 This makes it easier to quickly publish messages and go away. You don't need to set up and manage a connection.
@@ -35,6 +37,6 @@ If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer tha
 
 Yes. That's effectively what streams are. Sometimes they have extra features like managed consumer groups too :P
 
-### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets?
+### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets, and you added a clock for ordering?
 
-... next question
+Kinda, that's why I was able to make it in 500 loc in <10hrs of dev work

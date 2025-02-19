@@ -144,5 +144,19 @@ describe("Worker", () => {
 				expect(consumerData.records[0]).toHaveProperty("data")
 			}
 		})
+
+		it("should time out waiting for messages on an unwritten stream", async () => {
+			// Create a unique stream name that is never written to
+			const streamName = crypto.randomUUID()
+
+			// Initiate a consumer request in long polling mode (no offset provided)
+			const consumerResponse = await worker.fetch(`http://example.com/${streamName}?consumer_id=consumerTimeout&limit=5&timeout_sec=2`)
+			expect(consumerResponse.status).toBe(200)
+
+			const consumerData = (await consumerResponse.json()) as GetMessagesResponse
+			// Since this stream has never been written to, after timeout we expect empty records
+			expect(Array.isArray(consumerData.records)).toBe(true)
+			expect(consumerData.records.length).toBe(0)
+		})
 	})
 })
