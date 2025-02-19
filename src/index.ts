@@ -271,6 +271,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 			offsets.push(messageOffsets)
 		}
 
+		// TODO: do we still need the old last offset?
 		const oldLastOffset = this.lastOffset
 		this.lastOffset = offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1]
 
