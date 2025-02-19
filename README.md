@@ -7,7 +7,7 @@
 Stream offsets are 32 bytes, where the first 16 bytes are the zero-padded epoch interval when the log was
 flushed to storage, and the second 16 bytes being a 128-bit incrementing counter (it's probably impossible that this ever exceeds tens of thousands unless you have a massive epoch interval).
 
-Therefore if you want to read from a specific point in time, like now - 30 days, you could join a zero-padded now-30d unix milliseconds with 16 `0`'s to generate a timestamp like `00017399959663730000000000000000`.
+Therefore if you want to read from a specific point in time, like now - 30 days, you could join a zero-padded now-30d unix milliseconds with 16 `0`'s to generate a timestamp like `00017399959663730000000000000000`. That will represent all logs _flushed_ after that time, so you may want to additionally subtract your flush interval (or a few) to be safe.
 
 ## Difference from Workers PubSub and Workers Queues
 
