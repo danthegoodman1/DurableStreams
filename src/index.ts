@@ -23,14 +23,23 @@ interface PendingMessage {
 	records: string[]
 }
 
-interface WebSocketRPC {
-	method: string
+interface GetMessagesRequest {
+	consumerID: string
+
+	// "" means we long poll until a new message comes in
+	offset: string
+	limit: number
+	// only used for long polling
+	timeout_sec: number
 }
 
-interface GetMessagesRPC extends WebSocketRPC {
-	method: "get_messages"
-	after_offset?: string
-	limit?: number
+interface GetMessagesResponse {
+	records: Record[]
+}
+
+interface Record {
+	offset: string
+	data: any
 }
 
 interface ProduceBody {
@@ -48,8 +57,7 @@ function serializeOffset(epoch: number, counter: number): string {
 }
 
 export class StreamCoordinator extends DurableObject<Env> {
-	connectedWebsockets: number = 0
-	consumers: Map<WebSocket, string> = new Map()
+	consumers: Map<string, { emitter: EventEmitter<{ records: [Record[]] }>; limit: number }> = new Map()
 
 	lastOffset: string = ""
 	streamName: string = ""
@@ -145,25 +153,24 @@ export class StreamCoordinator extends DurableObject<Env> {
 			return this.handleProduce(request)
 		}
 
-		console.debug("detected potential websocket connection")
-
 		const url = new URL(request.url)
 		const consumerID = url.searchParams.get("consumer_id")
 		if (!consumerID) {
 			return new Response("Missing consumer_id query parameter", { status: 400 })
 		}
 
-		const webSocketPair = new WebSocketPair()
-		const [client, server] = Object.values(webSocketPair)
+		const offset = url.searchParams.get("offset")
+		const limit = url.searchParams.get("limit")
+		const timeout_sec = url.searchParams.get("timeout_sec")
 
-		this.ctx.acceptWebSocket(server)
-		this.connectedWebsockets++
-		this.consumers.set(server, consumerID)
+		const payload: GetMessagesRequest = {
+			consumerID,
+			offset: offset ?? "",
+			limit: Number(limit) ?? 100,
+			timeout_sec: Number(timeout_sec) ?? 10,
+		}
 
-		return new Response(null, {
-			status: 101,
-			webSocket: client,
-		})
+		return this.handleGetMessagesRequest(payload)
 	}
 
 	async handleProduce(request: Request): Promise<Response> {
@@ -194,44 +201,35 @@ export class StreamCoordinator extends DurableObject<Env> {
 		})
 	}
 
-	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-		let params: WebSocketRPC
-		try {
-			params = JSON.parse(message.toString())
-		} catch (error) {
-			console.error(error)
-			return
+	async handleGetMessagesRequest(payload: GetMessagesRequest): Promise<Response> {
+		if (payload.offset) {
+			const records = await this.getMessagesFromOffset(payload.offset, payload.limit)
+			return new Response(JSON.stringify({ records } as GetMessagesResponse), {
+				status: 200,
+			})
 		}
 
-		switch (params.method) {
-			case "get_messages":
-				await this.handleGetMessages(ws, params as GetMessagesRPC)
-				break
-				break
-		}
-	}
+		// Otherwise we wait for new messages to come in
+		const emitter = new EventEmitter<{ records: [Record[]] }>()
+		this.consumers.set(payload.consumerID, { emitter, limit: payload.limit })
+		const res = await Promise.race([
+			new Promise<Record[]>((resolve) => emitter.once("records", resolve)),
+			new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("timeout")), payload.timeout_sec * 1000)), // timeout 10s
+		])
 
-	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
-		this.connectedWebsockets--
-		this.consumers.delete(ws)
-	}
-
-	async webSocketError(ws: WebSocket, error: unknown) {}
-
-	async handleGetMessages(ws: WebSocket, params: GetMessagesRPC) {
-		const consumerID = this.consumers.get(ws)
-		if (!consumerID) {
-			console.error("No consumer ID found for WebSocket")
-			return
+		if (res instanceof Error) {
+			return new Response(JSON.stringify({ records: [] } as GetMessagesResponse), {
+				status: 200,
+			})
 		}
 
-		// TODO: stream messages to the consumer
+		return new Response(JSON.stringify({ records: res } as GetMessagesResponse), {
+			status: 200,
+		})
 	}
 
-	async onConsumerConnect(ws: WebSocket, consumerID: string) {
-		// TODO: check get their current offset from storage to check if they are overwriting
-		// TODO: if the offset is "-" then we should set them to the latest offset
-		// TODO: otherwise we need to send messages to them from the latest offset until the current offset
+	async getMessagesFromOffset(offset: string, limit: number): Promise<Record[]> {
+		// TODO: get messages from the offset up to limit
 	}
 
 	async alarm(alarmInfo?: AlarmInvocationInfo) {
@@ -295,13 +293,9 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		// poke all of the consumers to get new messages
 		console.debug("poking consumers to get new messages")
-		for (const ws of this.consumers.keys()) {
-			ws.send(
-				JSON.stringify({
-					event: "new_offset",
-					offset: this.lastOffset,
-				})
-			)
+		for (const emitter of this.consumers.keys()) {
+			// emitter.emit("records", records)
+			// TODO: emit records up to limit for the listener
 		}
 	}
 
