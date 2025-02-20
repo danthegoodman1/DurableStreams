@@ -2,6 +2,10 @@
 
 ## Usage (WIP)
 
+### Segment sizes
+
+You want to think of a segment size in terms of a row group for parquet: Every time you look up a batch of records, or a single record, it's going to pull at least one segment, so it should be relatively fast to get that even if it's the last segment.
+
 ### Reading from a point in time
 
 Stream offsets are 32 bytes, where the first 16 bytes are the zero-padded epoch interval when the log was
