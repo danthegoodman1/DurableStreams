@@ -53,3 +53,9 @@ Yes. That's effectively what streams are. Sometimes they have extra features lik
 ### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets, and you added a clock for ordering?
 
 Kinda, that's why I was able to make it in <1000 loc and <10hrs of dev work
+
+### Isn't this stuck on Cloudflare now though?
+
+Yes, but you can see how it's pretty easy to transplant this class to a generic HTTP framework, and swap out the KV and R2 specific bits for something like FDB and S3.
+
+In fact it's so simple, I bet o3-mini could port it to another language.
