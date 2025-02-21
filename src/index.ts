@@ -323,8 +323,6 @@ export class StreamCoordinator extends DurableObject<Env> {
 				// For each record, we need to generate an offset
 				messageOffsets.push(serializeOffset(this.epoch, this.counter))
 				this.counter++
-
-				// TODO We also need to write it to the log segment
 			}
 			offsets.push(messageOffsets)
 		}
