@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events"
 import { DurableObject } from "cloudflare:workers"
 import { generateLogSegmentName, parseLogSegmentName, readLines, SegmentMetadata } from "./segment"
 import { RBTree } from "bintrees"
+import { Mutex } from "async-mutex"
 
 const FlushIntervalMs = 200
 const hour = 1000 * 60 * 60
@@ -69,6 +70,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	counter: number = 0
 
 	tree: RBTree<SegmentMetadata>
+	treeMutex = new Mutex()
 
 	// Messages that are pending persistence in the flush interval
 	pendingMessages: PendingMessage[] = []
@@ -110,35 +112,40 @@ export class StreamCoordinator extends DurableObject<Env> {
 	 * Ensures that we load the latest state from storage before we being processing requests
 	 */
 	async ensureSetup() {
-		if (this.setup_listener) {
-			console.log("Waiting for setup to finish")
-			// We are not the first instance to start up, so wait for the setup to finish
-			await new Promise<void>((resolve) => this.setup_listener!.once("finish", resolve))
-			return
+		const release = await this.treeMutex.acquire()
+		try {
+			if (this.setup_listener) {
+				console.log("Waiting for setup to finish")
+				// We are not the first instance to start up, so wait for the setup to finish
+				await new Promise<void>((resolve) => this.setup_listener!.once("finish", resolve))
+				return
+			}
+
+			console.log("Doing setup")
+
+			// We are the first instance to start up, so we need to do the setup
+			this.setup_listener = new EventEmitter<{ finish: [] }>()
+
+			console.log("Building index from storage")
+			await this.buildIndexFromStorage()
+
+			if (this.tree.size === 0) {
+				console.debug("No segments found, skipping setup")
+				return this.finishSetup()
+			}
+
+			// Load the previous epoch if we have it. When we go to write
+			// we'll increment this and handle clock drift
+			const maxRecord = this.tree.max()!
+			this.epoch = parseOffset(maxRecord.lastOffset).epoch
+			const { stream } = parseLogSegmentName(maxRecord.name)
+			this.streamName = stream
+			console.debug(`Setup complete, epoch: ${this.epoch}, streamName: ${this.streamName}`)
+
+			this.finishSetup()
+		} finally {
+			release()
 		}
-
-		console.log("Doing setup")
-
-		// We are the first instance to start up, so we need to do the setup
-		this.setup_listener = new EventEmitter<{ finish: [] }>()
-
-		console.log("Building index from storage")
-		await this.buildIndexFromStorage()
-
-		if (this.tree.size === 0) {
-			console.debug("No segments found, skipping setup")
-			return this.finishSetup()
-		}
-
-		// Load the previous epoch if we have it. When we go to write
-		// we'll increment this and handle clock drift
-		const maxRecord = this.tree.max()!
-		this.epoch = parseOffset(maxRecord.lastOffset).epoch
-		const { stream } = parseLogSegmentName(maxRecord.name)
-		this.streamName = stream
-		console.debug(`Setup complete, epoch: ${this.epoch}, streamName: ${this.streamName}`)
-
-		this.finishSetup()
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -233,7 +240,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 	async getMessagesFromOffset(offset: string, limit: number): Promise<Record[]> {
 		// get the item from the tree that's below the offset
-		const segment = getSegmentAfterOffset(this.tree, offset)
+		const segment = await this.getSegmentAfterOffset(offset)
 		if (!segment) {
 			// We didn't find a segment that contains the offset, so we return an empty array
 			console.debug(`no messages segment found for offset ${offset}`)
@@ -330,11 +337,13 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		// Write the log segment metadata so the segment is persisted
 		console.debug("writing log segment metadata")
-		await this.writeLogSegmentMetadata({
-			name: segmentName,
-			firstOffset: offsets[0][0],
-			lastOffset: offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1],
-			createdMS: Date.now(),
+		await this.treeMutex.runExclusive(async () => {
+			await this.writeLogSegmentMetadata({
+				name: segmentName,
+				firstOffset: offsets[0][0],
+				lastOffset: offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1],
+				createdMS: Date.now(),
+			})
 		})
 
 		// Notify producer emitters to return
@@ -393,6 +402,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		console.log(`Wrote ${records} records to ${segmentName}`)
 	}
 
+	// Tree must be locked before calling this
 	async buildIndexFromStorage() {
 		const segments = await this.ctx.storage.list<SegmentMetadata>({
 			prefix: activeLogSegmentKey,
@@ -403,6 +413,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 	}
 
+	// Tree must be locked before calling this
 	async writeLogSegmentMetadata(metadata: SegmentMetadata) {
 		// First we need to durably store it
 		await this.ctx.storage.put(buildLogSegmentIndexKey(metadata.name), JSON.stringify(metadata))
@@ -421,48 +432,53 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// TODO: list R2 to find non-active segments that are older than the retention policy
 		// TODO: delete the segments from R2
 	}
-}
 
-// This helper function returns the SegmentMetadata that will contain the first offset AFTER the given offset
-function getSegmentAfterOffset(tree: RBTree<SegmentMetadata>, offset: string): SegmentMetadata | null {
-	// Create a dummy search key with the provided offset.
-	const searchKey = { firstOffset: offset } as SegmentMetadata
+	// This helper function returns the SegmentMetadata that will contain the first offset AFTER the given offset
+	async getSegmentAfterOffset(offset: string): Promise<SegmentMetadata | null> {
+		// Create a dummy search key with the provided offset.
+		const searchKey = { firstOffset: offset } as SegmentMetadata
 
-	// Use the tree's lowerBound to find the first element whose firstOffset is >= offset.
-	const it = tree.lowerBound(searchKey)
-	let candidate: SegmentMetadata | null = null
+		const release = await this.treeMutex.acquire()
+		try {
+			// Use the tree's lowerBound to find the first element whose firstOffset is >= offset.
+			const it = this.tree.lowerBound(searchKey)
+			let candidate: SegmentMetadata | null = null
 
-	// If lowerBound doesn't return an element, the tree may be empty or the offset is greater than all segments.
-	if (it.data() === null) {
-		console.debug(`no lower bound segment found for offset ${offset}`)
-		candidate = tree.max()
-	} else {
-		// If the found element exactly matches the offset, then that's our candidate.
-		if (it.data()!.firstOffset === offset) {
-			console.debug(`found exact segment ${it.data()!.name} for offset ${offset}`)
-			candidate = it.data()
-		} else {
-			// Otherwise, lowerBound returned the smallest element with firstOffset > offset.
-			// The candidate is the predecessor (largest segment with firstOffset less than offset).
-			const pred = it.prev()
-			if (pred === null) {
-				console.debug(`no predecessor found for offset ${offset}`)
-				candidate = null
+			// If lowerBound doesn't return an element, the tree may be empty or the offset is greater than all segments.
+			if (it.data() === null) {
+				console.debug(`no lower bound segment found for offset ${offset}`)
+				candidate = this.tree.max()
 			} else {
-				console.debug(`found predecessor ${pred.name} for offset ${offset}`)
-				candidate = pred
+				// If the found element exactly matches the offset, then that's our candidate.
+				if (it.data()!.firstOffset === offset) {
+					console.debug(`found exact segment ${it.data()!.name} for offset ${offset}`)
+					candidate = it.data()
+				} else {
+					// Otherwise, lowerBound returned the smallest element with firstOffset > offset.
+					// The candidate is the predecessor (largest segment with firstOffset less than offset).
+					const pred = it.prev()
+					if (pred === null) {
+						console.debug(`no predecessor found for offset ${offset}`)
+						candidate = null
+					} else {
+						console.debug(`found predecessor ${pred.name} for offset ${offset}`)
+						candidate = pred
+					}
+				}
 			}
+
+			// Verify the candidate's last offset is greater than the offset (single record segment)
+			if (candidate && candidate.lastOffset > offset) {
+				console.debug(`found segment ${candidate.name} covering offset ${offset}`)
+				return candidate
+			}
+
+			console.debug(`no segment covering offset ${offset} was found`)
+			return null
+		} finally {
+			release()
 		}
 	}
-
-	// Verify the candidate's last offset is greater than the offset (single record segment)
-	if (candidate && candidate.lastOffset > offset) {
-		console.debug(`found segment ${candidate.name} covering offset ${offset}`)
-		return candidate
-	}
-
-	console.debug(`no segment covering offset ${offset} was found`)
-	return null
 }
 
 export default {
