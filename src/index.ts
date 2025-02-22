@@ -176,8 +176,9 @@ export class StreamCoordinator extends DurableObject<Env> {
 			await this.ensureSetup()
 		}
 
-		// TODO: add method to force compaction for testing
-		// TODO: add method to force tombstone cleanup for testing
+		if (request.method === "PUT") {
+			return this.handleMetaRequest(request)
+		}
 
 		if (request.method === "POST") {
 			return this.handleProduce(request)
@@ -201,6 +202,13 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		return this.handleGetMessagesRequest(payload)
+	}
+
+	async handleMetaRequest(request: Request): Promise<Response> {
+		// TODO: add method to force compaction for testing
+		// TODO: add method to force tombstone cleanup for testing
+		// TODO: add method to set compaction settings
+		return new Response("NOT IMPLEMENTED", { status: 405 })
 	}
 
 	async handleProduce(request: Request): Promise<Response> {
