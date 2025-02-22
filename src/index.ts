@@ -17,6 +17,7 @@ const day = hour * 24
 const MaxStaleSegmentMs = day * 1
 const CompactLogSegmentsChance = 0.05
 const CleanTombstonesChance = 0.01
+const OrphanPurgingChance = 0.0001
 
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 const tombstoneKey = "tombstone::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
