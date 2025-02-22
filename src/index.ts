@@ -547,6 +547,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 			return
 		}
 
+		// TODO: list through all files in R2
+		// TODO: check if the files exist in the KV or the tombstones
+		// TODO: if none, log warning and delete the file from R2
+
 		console.debug("purging orphans")
 	}
 
