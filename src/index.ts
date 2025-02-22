@@ -11,6 +11,11 @@ const MaxStaleSegmentMs = day * 1
 const CompactLogSegmentsChance = 0.05
 const CleanTombstonesChance = 0.01
 
+// Compaction rules
+const MaxSegments = 10
+const MaxRecords = 5_000
+const MaxBytes = 10_000_000 // 10MB
+
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
 function buildLogSegmentIndexKey(segmentName: string): string {
@@ -439,11 +444,68 @@ export class StreamCoordinator extends DurableObject<Env> {
 			// Compact from the oldest segment to the newest
 			const iter = this.tree.iterator()
 			let item: SegmentMetadata | null = null
+			// did you know you could do this in JS?
+			let segmentWindow: SegmentMetadata[] = []
+			let totalBytes = 0
+			let totalRecords = 0
 			while ((item = iter.next()) !== null) {
-				// secret JS sauce
+				// We keep iterating until we hit a max number of segments, records, or bytes
+				// or, the next file already is too large to compact (we skip to start next window)
+
+				// Check the window limits
+				if (segmentWindow.length >= MaxSegments) {
+					// We hit the max number of segments, so we need to compact
+					console.debug("hit max number of segments, compacting")
+					break
+				}
+				if (totalBytes >= MaxBytes) {
+					// We hit the max number of bytes, so we need to compact
+					console.debug("hit max number of bytes, compacting")
+					break
+				}
+				if (totalRecords >= MaxRecords) {
+					// We hit the max number of records, so we need to compact
+					console.debug("hit max number of records, compacting")
+					break
+				}
+
+				// Check if we need to start a new window by skipping, or compact what we have
+				if (item.bytes > MaxBytes) {
+					if (segmentWindow.length < 2) {
+						// We need to skip and start a new window
+						console.debug(`next file ${item.name} has too many bytes, skipping because we don't have enough segments to compact`)
+						segmentWindow = []
+						continue
+					}
+
+					// Otherwise we need to compact what we have
+					console.debug(`next file ${item.name} has too many bytes, compacting`)
+					break
+				}
+				if (item.records > MaxRecords) {
+					if (segmentWindow.length < 2) {
+						// We need to skip and start a new window
+						console.debug(`next file ${item.name} has too many records, skipping because we don't have enough segments to compact`)
+						segmentWindow = []
+						continue
+					}
+
+					// Otherwise we need to compact what we have
+					console.debug(`next file ${item.name} has too many records, compacting`)
+					break
+				}
+
+				segmentWindow.push(item)
 			}
 
-			// TODO: check metadata to see if we need to compact log segments
+			// We either broke to compact, or we hit the end of the tree
+
+			if (segmentWindow.length < 2) {
+				// We don't have enough segments to compact, so we can't compact
+				console.debug("not enough segments to compact after iteration, exiting")
+				return
+			}
+
 			// TODO: k-way merge the segments with line readers
 			// TODO: transaction to update log segments
 		} finally {
