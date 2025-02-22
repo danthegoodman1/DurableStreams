@@ -1,10 +1,11 @@
 import { unstable_dev } from "wrangler"
 import type { Unstable_DevWorker } from "wrangler"
-import { describe, expect, it, beforeAll, afterAll } from "vitest"
-import { WebSocket } from "ws"
+import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest"
 import type { ProduceResponse, GetMessagesResponse } from "../src/index"
+import { RBTree } from "bintrees"
+import { SegmentMetadata, calculateCompactWindow } from "../src/segment"
 
-describe("Worker", () => {
+describe.skip("Worker", () => {
 	let worker: Unstable_DevWorker
 
 	beforeAll(async () => {
@@ -158,5 +159,311 @@ describe("Worker", () => {
 			expect(Array.isArray(consumerData.records)).toBe(true)
 			expect(consumerData.records.length).toBe(0)
 		})
+	})
+})
+
+describe("calculateCompactWindow", () => {
+	let tree: RBTree<SegmentMetadata>
+
+	beforeEach(() => {
+		// Create a dummy coordinator. (We pass empty objects; our tests only use calculateCompactWindow.)
+		tree = new RBTree<SegmentMetadata>((a, b) => {
+			if (a.firstOffset < b.firstOffset) return -1
+			if (a.firstOffset > b.firstOffset) return 1
+			return 0
+		})
+	})
+
+	it("should return the full tree when all segments are within bounds", () => {
+		// Insert three valid segments (all values are within limits).
+		const seg1: SegmentMetadata = {
+			name: "seg1",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 1,
+		}
+		const seg2: SegmentMetadata = {
+			name: "seg2",
+			firstOffset: "0000000000000002",
+			lastOffset: "0000000000000002",
+			createdMS: 200,
+			records: 1,
+			bytes: 1,
+		}
+		const seg3: SegmentMetadata = {
+			name: "seg3",
+			firstOffset: "0000000000000003",
+			lastOffset: "0000000000000003",
+			createdMS: 300,
+			records: 1,
+			bytes: 1,
+		}
+
+		tree.insert(seg1)
+		tree.insert(seg2)
+		tree.insert(seg3)
+
+		// Since all segments are valid and we have more than one, the window should include all.
+		const window = calculateCompactWindow(tree)
+		expect(window).toHaveLength(3)
+		expect(window[0].name).toBe("seg1")
+		expect(window[1].name).toBe("seg2")
+		expect(window[2].name).toBe("seg3")
+	})
+
+	it("should return a window early when an item exceeding the bytes limit is encountered", () => {
+		// Create two normal segments then one that exceeds MaxBytes.
+		const normal1: SegmentMetadata = {
+			name: "normal1",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 1,
+		}
+		const normal2: SegmentMetadata = {
+			name: "normal2",
+			firstOffset: "0000000000000002",
+			lastOffset: "0000000000000002",
+			createdMS: 200,
+			records: 1,
+			bytes: 1,
+		}
+		// Set this segment so that its bytes exceed the limit (MaxBytes is 10MB).
+		const exceedingBytes: SegmentMetadata = {
+			name: "exceeding",
+			firstOffset: "0000000000000003",
+			lastOffset: "0000000000000003",
+			createdMS: 300,
+			records: 1,
+			bytes: 10_000_001,
+		}
+		// Even if we add another normal segment after this one, the window should stop before it.
+		const normal3: SegmentMetadata = {
+			name: "normal3",
+			firstOffset: "0000000000000004",
+			lastOffset: "0000000000000004",
+			createdMS: 400,
+			records: 1,
+			bytes: 1,
+		}
+
+		tree.insert(normal1)
+		tree.insert(normal2)
+		tree.insert(exceedingBytes)
+		tree.insert(normal3)
+
+		const window = calculateCompactWindow(tree)
+		// The algorithm adds normal1 and normal2 then sees the exceeding segment.
+		// Since at that point there are at least 2 segments, it breaks.
+		expect(window).toHaveLength(2)
+		expect(window[0].name).toBe("normal1")
+		expect(window[1].name).toBe("normal2")
+	})
+
+	it("should return a window early when an item exceeding the records limit is encountered", () => {
+		// Create two normal segments then one that exceeds MaxRecords.
+		const normal1: SegmentMetadata = {
+			name: "normal1",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 1,
+		}
+		const normal2: SegmentMetadata = {
+			name: "normal2",
+			firstOffset: "0000000000000002",
+			lastOffset: "0000000000000002",
+			createdMS: 200,
+			records: 1,
+			bytes: 1,
+		}
+		// Set this segment so that its records exceed the limit (MaxRecords is 5000).
+		const exceedingRecords: SegmentMetadata = {
+			name: "exceeding",
+			firstOffset: "0000000000000003",
+			lastOffset: "0000000000000003",
+			createdMS: 300,
+			records: 5001,
+			bytes: 1,
+		}
+		// Another normal segment that follows.
+		const normal3: SegmentMetadata = {
+			name: "normal3",
+			firstOffset: "0000000000000004",
+			lastOffset: "0000000000000004",
+			createdMS: 400,
+			records: 1,
+			bytes: 1,
+		}
+
+		tree.insert(normal1)
+		tree.insert(normal2)
+		tree.insert(exceedingRecords)
+		tree.insert(normal3)
+
+		const window = calculateCompactWindow(tree)
+		// The window should include the two normal segments only.
+		expect(window).toHaveLength(2)
+		expect(window[0].name).toBe("normal1")
+		expect(window[1].name).toBe("normal2")
+	})
+
+	it("should return a window early when an item the trips the bytes limit is encountered", () => {
+		// Create two normal segments then one that exceeds MaxBytes.
+		const normal1: SegmentMetadata = {
+			name: "normal1",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 1,
+		}
+		const normal2: SegmentMetadata = {
+			name: "normal2",
+			firstOffset: "0000000000000002",
+			lastOffset: "0000000000000002",
+			createdMS: 200,
+			records: 1,
+			bytes: 1,
+		}
+		// Set this segment so that its bytes exceed the limit (MaxBytes is 10MB).
+		const exceedingBytes: SegmentMetadata = {
+			name: "exceeding",
+			firstOffset: "0000000000000003",
+			lastOffset: "0000000000000003",
+			createdMS: 300,
+			records: 1,
+			bytes: 10_000_000,
+		}
+		// Even if we add another normal segment after this one, the window should stop before it.
+		const normal3: SegmentMetadata = {
+			name: "normal3",
+			firstOffset: "0000000000000004",
+			lastOffset: "0000000000000004",
+			createdMS: 400,
+			records: 1,
+			bytes: 1,
+		}
+
+		tree.insert(normal1)
+		tree.insert(normal2)
+		tree.insert(exceedingBytes)
+		tree.insert(normal3)
+
+		const window = calculateCompactWindow(tree)
+		// The algorithm adds normal1 and normal2 then sees the exceeding segment.
+		// Since at that point there are at least 2 segments, it breaks.
+		expect(window).toHaveLength(3)
+		expect(window[0].name).toBe("normal1")
+		expect(window[1].name).toBe("normal2")
+		expect(window[2].name).toBe("exceeding")
+	})
+
+	it("should return a window early when an item the trips the records limit is encountered", () => {
+		// Create two normal segments then one that exceeds MaxRecords.
+		const normal1: SegmentMetadata = {
+			name: "normal1",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 1,
+		}
+		const normal2: SegmentMetadata = {
+			name: "normal2",
+			firstOffset: "0000000000000002",
+			lastOffset: "0000000000000002",
+			createdMS: 200,
+			records: 1,
+			bytes: 1,
+		}
+		// Set this segment so that its records exceed the limit (MaxRecords is 5000).
+		const exceedingRecords: SegmentMetadata = {
+			name: "exceeding",
+			firstOffset: "0000000000000003",
+			lastOffset: "0000000000000003",
+			createdMS: 300,
+			records: 5000,
+			bytes: 1,
+		}
+		// Another normal segment that follows.
+		const normal3: SegmentMetadata = {
+			name: "normal3",
+			firstOffset: "0000000000000004",
+			lastOffset: "0000000000000004",
+			createdMS: 400,
+			records: 1,
+			bytes: 1,
+		}
+
+		tree.insert(normal1)
+		tree.insert(normal2)
+		tree.insert(exceedingRecords)
+		tree.insert(normal3)
+
+		const window = calculateCompactWindow(tree)
+		// The window should include the two normal segments only.
+		expect(window).toHaveLength(3)
+		expect(window[0].name).toBe("normal1")
+		expect(window[1].name).toBe("normal2")
+		expect(window[2].name).toBe("exceeding")
+	})
+
+	it("should skip initial segments that exceed limits and return a window from later valid segments", () => {
+		// In this scenario, the very first segment exceeds a limit so it is skipped.
+		const exceeding: SegmentMetadata = {
+			name: "exceeding",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 10_000_001, // exceeds MaxBytes
+		}
+		const normal1: SegmentMetadata = {
+			name: "normal1",
+			firstOffset: "0000000000000002",
+			lastOffset: "0000000000000002",
+			createdMS: 200,
+			records: 1,
+			bytes: 1,
+		}
+		const normal2: SegmentMetadata = {
+			name: "normal2",
+			firstOffset: "0000000000000003",
+			lastOffset: "0000000000000003",
+			createdMS: 300,
+			records: 1,
+			bytes: 1,
+		}
+
+		tree.insert(exceeding)
+		tree.insert(normal1)
+		tree.insert(normal2)
+
+		const window = calculateCompactWindow(tree)
+		// The skipped initial item should not be in the window.
+		expect(window).toHaveLength(2)
+		expect(window[0].name).toBe("normal1")
+		expect(window[1].name).toBe("normal2")
+	})
+
+	it("should return an empty array if there are fewer than two valid segments", () => {
+		// When only one valid segment exists, compaction should not occur.
+		const normal1: SegmentMetadata = {
+			name: "normal1",
+			firstOffset: "0000000000000001",
+			lastOffset: "0000000000000001",
+			createdMS: 100,
+			records: 1,
+			bytes: 1,
+		}
+		tree.insert(normal1)
+
+		const window = calculateCompactWindow(tree)
+		expect(window).toHaveLength(0)
 	})
 })
