@@ -458,16 +458,47 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 		console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => s.name).join(", ")}`)
 
-		// TODO: k-way merge the segments with line readers to a new segment file
-
+		// k-way merge the segments with line readers to a new segment file
+		const totalLength = segmentWindow.reduce((acc, s) => acc + s.bytes, 0)
 		const newSegmentName = generateLogSegmentName(this.epoch, ".compacted.seg")
+
+		const { readable, writable } = new FixedLengthStream(totalLength)
+		const writer = writable.getWriter()
+
+		// Start streaming the records to the file
+		const writePromise = this.env.StreamData.put(generateLogSegmentPath(this.streamName, newSegmentName), readable)
+
+		// Create a reader for each of the segments
+		const readers = await Promise.all(
+			segmentWindow.map(async (s) => this.env.StreamData.get(generateLogSegmentPath(this.streamName, s.name)))
+		)
+		// Verify all the readers are valid
+		for (let i = 0; i < segmentWindow.length; i++) {
+			if (!readers[i]) {
+				console.error(`Segment ${segmentWindow[i].name} does not exist, data is corrupted`)
+				return
+			}
+		}
+
+		// Begin the k-way merge: this will write records from all segments in order.
+		const mergePromise = kWayMerge(
+			readers.map((r) => readLines(r!.body)),
+			writer
+		)
+
+		// Wait for the merge to finish (which in turn closes the writer)
+		await mergePromise
+
+		// Finally, wait for the record to be persisted to R2.
+		await writePromise
+
 		const newSegment: SegmentMetadata = {
 			name: newSegmentName,
 			firstOffset: segmentWindow[0].firstOffset,
 			lastOffset: segmentWindow[segmentWindow.length - 1].lastOffset,
 			createdMS: Date.now(),
 			records: segmentWindow.reduce((acc, s) => acc + s.records, 0),
-			bytes: segmentWindow.reduce((acc, s) => acc + s.bytes, 0),
+			bytes: totalLength,
 		}
 
 		// transaction to update log segments and store tombstones
@@ -565,3 +596,59 @@ export default {
 		return stub.fetch(request)
 	},
 } satisfies ExportedHandler<Env>
+
+/**
+ * Merges multiple sorted line readers into a single writer.
+ * Each line is assumed to have a record ID in its first 32 characters.
+ * The function "peeks" one line from each reader and writes out the smallest ID line,
+ * advancing that reader only when its line has been written.
+ */
+async function kWayMerge(lineReaders: AsyncIterable<string>[], writer: WritableStreamDefaultWriter<Uint8Array>) {
+	interface BufferEntry {
+		line: string
+		iterator: AsyncIterator<string>
+	}
+
+	// Initialize each reader by fetching its first line
+	const buffers: BufferEntry[] = []
+	for (const reader of lineReaders) {
+		const iterator = reader[Symbol.asyncIterator]()
+		const result = await iterator.next()
+		if (!result.done) {
+			buffers.push({ line: result.value, iterator })
+		}
+	}
+
+	// Utility function to extract record ID from a line.
+	// In our case the record ID is the first 32 characters.
+	const getRecordID = (line: string): string => line.slice(0, 32)
+
+	// Continue until every reader has been exhausted
+	while (buffers.length > 0) {
+		// Find the buffered line with the smallest record ID.
+		let minIndex = 0
+		let minRecordID = getRecordID(buffers[0].line)
+		for (let i = 1; i < buffers.length; i++) {
+			const currID = getRecordID(buffers[i].line)
+			if (currID < minRecordID) {
+				minRecordID = currID
+				minIndex = i
+			}
+		}
+		const smallestEntry = buffers[minIndex]
+
+		// Write the chosen line (append a newline if it wasn't included)
+		const buffer = new TextEncoder().encode(smallestEntry.line + "\n")
+		await writer.write(buffer)
+
+		// Advance the iterator for the reader we just used.
+		const nextResult = await smallestEntry.iterator.next()
+		if (nextResult.done) {
+			// Remove this reader from our buffers if there are no more lines.
+			buffers.splice(minIndex, 1)
+		} else {
+			buffers[minIndex].line = nextResult.value
+		}
+	}
+	await writer.close()
+}
