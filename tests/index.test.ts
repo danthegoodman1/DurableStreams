@@ -70,13 +70,17 @@ describe("Worker", () => {
 			const consumerData = (await consumerResponse.json()) as GetMessagesResponse
 			expect(Array.isArray(consumerData.records)).toBe(true)
 			// Since the limit is 2, we expect at most 2 records
-			expect(consumerData.records.length).toBeLessThanOrEqual(2)
+			expect(consumerData.records.length).toBe(2)
 
 			// Optionally verify each record contains an offset and some data
 			if (consumerData.records.length > 0) {
 				expect(consumerData.records[0]).toHaveProperty("offset")
 				expect(consumerData.records[0]).toHaveProperty("data")
 			}
+
+			// Verify it's the records we produced
+			expect(consumerData.records[0].data.value).toBe("msg-1")
+			expect(consumerData.records[1].data.value).toBe("msg-2")
 		})
 
 		it("should allow a consumer to get messages from a given offset with a limit", async () => {
@@ -112,6 +116,9 @@ describe("Worker", () => {
 				expect(consumerData.records[0]).toHaveProperty("data")
 				expect(consumerData.records[0].data.value).toBe("second")
 			}
+
+			// Verify the data is in the correct segment
+			expect(consumerData.records[0].data.value).toBe("second")
 		})
 
 		it("should allow a consumer to long-poll and receive new messages immediately", async () => {
@@ -144,6 +151,9 @@ describe("Worker", () => {
 				expect(consumerData.records[0]).toHaveProperty("offset")
 				expect(consumerData.records[0]).toHaveProperty("data")
 			}
+
+			expect(consumerData.records[0].data.value).toBe("live-1")
+			expect(consumerData.records[1].data.value).toBe("live-2")
 		})
 
 		it("should time out waiting for messages on an unwritten stream", async () => {
@@ -158,6 +168,50 @@ describe("Worker", () => {
 			// Since this stream has never been written to, after timeout we expect empty records
 			expect(Array.isArray(consumerData.records)).toBe(true)
 			expect(consumerData.records.length).toBe(0)
+		})
+	})
+
+	describe("StreamCoordinator - Merge", () => {
+		it("should merge segments and return merged records", async () => {
+			const streamName = crypto.randomUUID()
+
+			// Produce the first batch of messages.
+			const produceResp1 = await worker.fetch(`http://example.com/${streamName}`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "a" }, { value: "b" }, { value: "c" }],
+				}),
+			})
+			expect(produceResp1.status).toBe(200)
+			const produceData1 = (await produceResp1.json()) as ProduceResponse
+			expect(produceData1.offsets).toBeDefined()
+
+			// Produce the second batch of messages.
+			const produceResp2 = await worker.fetch(`http://example.com/${streamName}`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "d" }, { value: "e" }],
+				}),
+			})
+			expect(produceResp2.status).toBe(200)
+			const produceData2 = (await produceResp2.json()) as ProduceResponse
+			expect(produceData2.offsets).toBeDefined()
+
+			// Increase the wait time to ensure the merge (compaction) completes.
+			await new Promise((resolve) => setTimeout(resolve, 500))
+
+			// Consume messages from the beginning of the stream.
+			const consumerResp = await worker.fetch(`http://example.com/${streamName}?consumer_id=mergeConsumer&offset=-&limit=10&timeout_sec=5`)
+			expect(consumerResp.status).toBe(200)
+			const consumerData = (await consumerResp.json()) as GetMessagesResponse
+			expect(Array.isArray(consumerData.records)).toBe(true)
+			// We expect all 5 messages (3 from the first, 2 from the second) to be merged.
+			expect(consumerData.records.length).toBe(5)
+			expect(consumerData.records[0].data.value).toBe("a")
+			expect(consumerData.records[1].data.value).toBe("b")
+			expect(consumerData.records[2].data.value).toBe("c")
+			expect(consumerData.records[3].data.value).toBe("d")
+			expect(consumerData.records[4].data.value).toBe("e")
 		})
 	})
 })

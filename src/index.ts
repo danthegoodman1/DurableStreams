@@ -15,12 +15,14 @@ const FlushIntervalMs = 200
 const hour = 1000 * 60 * 60
 const day = hour * 24
 const MaxStaleSegmentMs = day * 1
-const CompactLogSegmentsChance = 0.05
+const CompactLogSegmentsChance = 1 // temp for testing
 const CleanTombstonesChance = 0.01
 const OrphanPurgingChance = 0.0001
 
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 const tombstoneKey = "tombstone::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
+
+const zeroOffset = "00000000000000000000000000000000"
 
 function buildLogSegmentIndexKey(segmentName: string): string {
 	return `${activeLogSegmentKey}${segmentName}`
@@ -71,7 +73,7 @@ function parseOffset(offset: string): { epoch: number; counter: number } {
 	return { epoch: Number(epoch), counter: Number(counter) }
 }
 
-function serializeOffset(epoch: number, counter: number): string {
+function serializeOffset(epoch: number, counter: number | string): string {
 	// 16 digits is max safe integer for JS
 	return `${epoch.toString().padStart(16, "0")}${counter.toString().padStart(16, "0")}`
 }
@@ -174,6 +176,9 @@ export class StreamCoordinator extends DurableObject<Env> {
 			await this.ensureSetup()
 		}
 
+		// TODO: add method to force compaction for testing
+		// TODO: add method to force tombstone cleanup for testing
+
 		if (request.method === "POST") {
 			return this.handleProduce(request)
 		}
@@ -263,7 +268,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		// verify the offset is in the range
-		if (segment.firstOffset > offset || segment.lastOffset < offset) {
+		if (offset !== "-" && segment.lastOffset < offset) {
 			// The offset is outside the range, this is a bug
 			console.error("Offset is outside the range of the segment", offset, segment)
 			return []
@@ -382,8 +387,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// Send records to waiting consumers
 		console.debug("poking consumers to get new messages")
 		for (const [consumerID, consumer] of this.consumers.entries()) {
-			console.debug(`getting messages from offset ${offsets[0][0]} for consumer ${consumerID}`)
-			const records = await this.getMessagesFromOffset(offsets[0][0], consumer.limit)
+			// We need to use the offset just below this epoch, so we don't miss any records so decrement epoch and use max counter
+			const pokeOffset = serializeOffset(this.epoch - 1, "9".repeat(16))
+			console.debug(`getting messages from offset ${offsets[0][0]} using poke offset ${pokeOffset} for consumer ${consumerID}`)
+			const records = await this.getMessagesFromOffset(pokeOffset, consumer.limit)
 			console.debug(`got ${records.length} records for consumer ${consumerID}`)
 			if (records.length > 0) {
 				console.debug(`emitting ${records.length} records to consumer ${consumerID}`)
@@ -445,7 +452,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async compactLogSegments() {
-		if (Math.random() < CompactLogSegmentsChance) {
+		if (Math.random() > CompactLogSegmentsChance) {
+			console.debug("NOT compacting log segments")
 			return
 		}
 
@@ -456,7 +464,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 			console.debug("not enough segments to compact after iteration, exiting")
 			return
 		}
-		console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => s.name).join(", ")}`)
+		console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => JSON.stringify(s, null, 2)).join(", ")}`)
 
 		// k-way merge the segments with line readers to a new segment file
 		const totalLength = segmentWindow.reduce((acc, s) => acc + s.bytes, 0)
@@ -518,10 +526,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 			}
 			this.tree.insert(newSegment)
 		})
+
+		console.debug("compacted log segments into", newSegment)
 	}
 
 	async cleanTombstones() {
-		if (Math.random() < CleanTombstonesChance) {
+		if (Math.random() > CleanTombstonesChance) {
 			return
 		}
 
@@ -533,7 +543,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async purgeOrphans() {
-		if (Math.random() < OrphanPurgingChance) {
+		if (Math.random() > OrphanPurgingChance) {
 			return
 		}
 
@@ -547,31 +557,25 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		const release = await this.treeMutex.acquire()
 		try {
+			if (offset === "-") {
+				// If the offset is "-", we want the first segment
+				console.debug("getting first segment from '-' offset")
+				return this.tree.min()
+			}
+
 			// Use the tree's lowerBound to find the first element whose firstOffset is >= offset.
 			const it = this.tree.lowerBound(searchKey)
 			let candidate: SegmentMetadata | null = null
 
 			// If lowerBound doesn't return an element, the tree may be empty or the offset is greater than all segments.
-			if (it.data() === null) {
+			const segment = it.data()
+			console.debug("segment", segment)
+			if (segment === null) {
 				console.debug(`no lower bound segment found for offset ${offset}`)
 				candidate = this.tree.max()
-			} else {
-				// If the found element exactly matches the offset, then that's our candidate.
-				if (it.data()!.firstOffset === offset) {
-					console.debug(`found exact segment ${it.data()!.name} for offset ${offset}`)
-					candidate = it.data()
-				} else {
-					// Otherwise, lowerBound returned the smallest element with firstOffset > offset.
-					// The candidate is the predecessor (largest segment with firstOffset less than offset).
-					const pred = it.prev()
-					if (pred === null) {
-						console.debug(`no predecessor found for offset ${offset}`)
-						candidate = null
-					} else {
-						console.debug(`found predecessor ${pred.name} for offset ${offset}`)
-						candidate = pred
-					}
-				}
+			} else if (segment.lastOffset > offset) {
+				// Otherwise the segment is the candidate
+				candidate = segment
 			}
 
 			// Verify the candidate's last offset is greater than the offset (single record segment)
