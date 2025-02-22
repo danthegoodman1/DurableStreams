@@ -304,6 +304,14 @@ export class StreamCoordinator extends DurableObject<Env> {
 		await this.cleanTombstones()
 	}
 
+	calculateTotalLength(pendingMessages: PendingMessage[]) {
+		// Calculate the total overhead: 33 bytes per record (32 bytes for the offset name + 1 byte for the newline)
+		const totalOverhead = pendingMessages.reduce((acc, m) => acc + m.records.length, 0) * 33
+		// Sum of lengths of all the JSON record strings
+		const totalRecordsLength = pendingMessages.reduce((acc, m) => acc + m.records.reduce((acc, r) => acc + r.length, 0), 0)
+		return totalOverhead + totalRecordsLength
+	}
+
 	async flushPendingMessages() {
 		console.debug("flushing pending messages")
 		// Increment the epoch and reset the counter
@@ -344,6 +352,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 				firstOffset: offsets[0][0],
 				lastOffset: offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1],
 				createdMS: Date.now(),
+				records: this.counter, // the counter is the number of records written
+				bytes: this.calculateTotalLength(this.pendingMessages),
 			})
 		})
 
@@ -370,11 +380,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async writePendingMessagesToLogSegment(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
-		// Calculate the total overhead: 33 bytes per record (32 bytes for the offset name + 1 byte for the newline)
-		const totalOverhead = pendingMessages.reduce((acc, m) => acc + m.records.length, 0) * 33
-		// Sum of lengths of all the JSON record strings
-		const totalRecordsLength = pendingMessages.reduce((acc, m) => acc + m.records.reduce((acc, r) => acc + r.length, 0), 0)
-		const totalLength = totalOverhead + totalRecordsLength
+		const totalLength = this.calculateTotalLength(pendingMessages)
 
 		const { readable, writable } = new FixedLengthStream(totalLength)
 		const writer = writable.getWriter()
@@ -428,9 +434,21 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		console.debug("compacting log segments")
-		// TODO: check metadata to see if we need to compact log segments
-		// TODO: k-way merge the segments with line readers
-		// TODO: transaction to update log segments
+		const release = await this.treeMutex.acquire()
+		try {
+			// Compact from the oldest segment to the newest
+			const iter = this.tree.iterator()
+			let item: SegmentMetadata | null = null
+			while ((item = iter.next()) !== null) {
+				// secret JS sauce
+			}
+
+			// TODO: check metadata to see if we need to compact log segments
+			// TODO: k-way merge the segments with line readers
+			// TODO: transaction to update log segments
+		} finally {
+			release()
+		}
 	}
 
 	async cleanTombstones() {

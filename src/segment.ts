@@ -7,6 +7,8 @@ export interface SegmentMetadata {
 	 * multiple times in the index would save memory, however this should never be that large.
 	 */
 	name: string
+	records: number
+	bytes: number
 }
 
 /**
