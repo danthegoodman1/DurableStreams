@@ -497,6 +497,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		// TODO: get snapshot of what segments are active
 		// TODO: list R2 to find non-active segments that are older than the retention policy
 		// TODO: delete the segments from R2
+
+		// TODO: Random chance to do orphan purging (look through r2 list and find files that aren't in the tree or tombstone list)
 	}
 
 	// This helper function returns the SegmentMetadata that will contain the first offset AFTER the given offset
