@@ -13,6 +13,10 @@ flushed to storage, and the second 16 bytes being a 128-bit incrementing counter
 
 Therefore if you want to read from a specific point in time, like now - 30 days, you could join a zero-padded now-30d unix milliseconds with 16 `0`'s to generate a timestamp like `00017399959663730000000000000000`. That will represent all logs _flushed_ after that time, so you may want to additionally subtract your flush interval (or a few) to be safe.
 
+### Compaction settings
+
+Because Durable Objects are limited to 128MB, we have to be mindful of memory. The largest use of memory will be the segment metadata index. As a result, when your stream grows (really large) in size, you'll have to start increasing the compaction threshold to reduce the number of total segments, thus reducing memory usage. It's safe to adjust compaction settings on the fly by redeploying, but at the moment there's no way to change it for a single stream (see GH issue).
+
 ## Difference from Workers PubSub and Workers Queues
 
 It's a funadamentally different model, that same reason you'd use Kafka over RabbitMQ or Redis list: Streams are immutable, ordered, and consumers can pull them when ever.
