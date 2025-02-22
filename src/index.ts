@@ -455,7 +455,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 			return
 		}
 		console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => s.name).join(", ")}`)
-		// TODO: k-way merge the segments with line readers
+
+		// TODO: k-way merge the segments with line readers to a new segment file
 
 		const newSegmentName = generateLogSegmentName(this.epoch, ".compacted.seg")
 		const newSegment: SegmentMetadata = {
