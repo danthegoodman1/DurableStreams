@@ -8,6 +8,8 @@ const FlushIntervalMs = 200
 const hour = 1000 * 60 * 60
 const day = hour * 24
 const MaxStaleSegmentMs = day * 1
+const CompactLogSegmentsChance = 0.05
+const CleanTombstonesChance = 0.01
 
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
@@ -296,9 +298,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 	async alarm(alarmInfo?: AlarmInvocationInfo) {
 		console.debug("alarm waking up")
+		// Do these sequentially so they're not racing for locks
 		await this.flushPendingMessages()
-		// TODO: Check if we need to compact log segments (random chance, increasing with segment index size)
-		// TODO: Check if we need to tombstone (random chance)
+		await this.compactLogSegments()
+		await this.cleanTombstones()
 	}
 
 	async flushPendingMessages() {
@@ -419,13 +422,24 @@ export class StreamCoordinator extends DurableObject<Env> {
 		this.tree.insert(metadata)
 	}
 
-	async compactLogSegments(segments: SegmentMetadata[]) {
+	async compactLogSegments() {
+		if (Math.random() < CompactLogSegmentsChance) {
+			return
+		}
+
+		console.debug("compacting log segments")
 		// TODO: check metadata to see if we need to compact log segments
 		// TODO: k-way merge the segments with line readers
 		// TODO: transaction to update log segments
 	}
 
 	async cleanTombstones() {
+		if (Math.random() < CleanTombstonesChance) {
+			return
+		}
+
+		console.debug("cleaning tombstones")
+
 		// TODO: get snapshot of what segments are active
 		// TODO: list R2 to find non-active segments that are older than the retention policy
 		// TODO: delete the segments from R2
