@@ -43,8 +43,12 @@ export async function* readLines(stream: ReadableStream<Uint8Array>) {
 	}
 }
 
-export function generateLogSegmentName(stream: string, epoch: number) {
-	return `${stream}/${epoch}:${crypto.randomUUID()}.seg`
+export function generateLogSegmentName(epoch: number, extension: string = ".seg") {
+	return `${epoch}:${crypto.randomUUID()}${extension}`
+}
+
+export function generateLogSegmentPath(stream: string, name: string) {
+	return `${stream}/${name}`
 }
 
 export function parseLogSegmentName(name: string): { stream: string; epoch: number; uuid: string } {

@@ -1,6 +1,13 @@
 import { EventEmitter } from "node:events"
 import { DurableObject } from "cloudflare:workers"
-import { calculateCompactWindow, generateLogSegmentName, parseLogSegmentName, readLines, SegmentMetadata } from "./segment"
+import {
+	calculateCompactWindow,
+	generateLogSegmentName,
+	generateLogSegmentPath,
+	parseLogSegmentName,
+	readLines,
+	SegmentMetadata,
+} from "./segment"
 import { RBTree } from "bintrees"
 import { Mutex } from "async-mutex"
 
@@ -12,9 +19,14 @@ const CompactLogSegmentsChance = 0.05
 const CleanTombstonesChance = 0.01
 
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
+const tombstoneKey = "tombstone::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
 function buildLogSegmentIndexKey(segmentName: string): string {
 	return `${activeLogSegmentKey}${segmentName}`
+}
+
+function buildTombstoneKey(segmentName: string): string {
+	return `${tombstoneKey}${segmentName}`
 }
 
 export interface PendingMessage {
@@ -257,7 +269,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		// Load the segment from R2
-		const segmentData = await this.env.StreamData.get(segment.name)
+		const segmentData = await this.env.StreamData.get(generateLogSegmentPath(this.streamName, segment.name))
 		if (!segmentData) {
 			// The segment doesn't exist, this is a bug
 			console.error("Segment does not exist", segment)
@@ -324,7 +336,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 			this.epoch = oldEpoch + 1
 		}
 
-		const segmentName = generateLogSegmentName(this.streamName, this.epoch)
+		const segmentName = generateLogSegmentName(this.epoch)
 
 		const offsets: string[][] = []
 		for (const message of this.pendingMessages) {
@@ -342,7 +354,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		// Write the pending messages to the log segment
 		console.debug("writing pending messages to log segment")
-		await this.writePendingMessagesToLogSegment(segmentName, offsets, this.pendingMessages)
+		await this.writePendingMessagesToLogSegment(this.streamName, segmentName, offsets, this.pendingMessages)
 
 		// Write the log segment metadata so the segment is persisted
 		console.debug("writing log segment metadata")
@@ -379,14 +391,16 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 	}
 
-	async writePendingMessagesToLogSegment(segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
+	async writePendingMessagesToLogSegment(streamName: string, segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
 		const totalLength = this.calculateTotalLength(pendingMessages)
+
+		const segmentPath = generateLogSegmentPath(streamName, segmentName)
 
 		const { readable, writable } = new FixedLengthStream(totalLength)
 		const writer = writable.getWriter()
 
 		// Start streaming the records to the file
-		const writePromise = this.env.StreamData.put(segmentName, readable)
+		const writePromise = this.env.StreamData.put(segmentPath, readable)
 
 		// Write the records to the file
 		let records = 0
@@ -404,9 +418,9 @@ export class StreamCoordinator extends DurableObject<Env> {
 			}
 		}
 
-		console.debug(`Writing ${records} records to ${segmentName} with actual length ${actualLength} and expected length ${totalLength}`)
+		console.debug(`Writing ${records} records to ${segmentPath} with actual length ${actualLength} and expected length ${totalLength}`)
 		await Promise.all([writer.close(), writePromise])
-		console.log(`Wrote ${records} records to ${segmentName}`)
+		console.log(`Wrote ${records} records to ${segmentPath}`)
 	}
 
 	// Tree must be locked before calling this
@@ -434,21 +448,42 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		console.debug("compacting log segments")
-		const release = await this.treeMutex.acquire()
-		try {
-			const segmentWindow = calculateCompactWindow(this.tree)
-			if (segmentWindow.length < 2) {
-				// We don't have enough segments to compact, so we can't compact
-				console.debug("not enough segments to compact after iteration, exiting")
-				return
-			}
-			console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => s.name).join(", ")}`)
-
-			// TODO: k-way merge the segments with line readers
-			// TODO: transaction to update log segments
-		} finally {
-			release()
+		const segmentWindow = await this.treeMutex.runExclusive(async () => calculateCompactWindow(this.tree))
+		if (segmentWindow.length < 2) {
+			// We don't have enough segments to compact, so we can't compact
+			console.debug("not enough segments to compact after iteration, exiting")
+			return
 		}
+		console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => s.name).join(", ")}`)
+		// TODO: k-way merge the segments with line readers
+
+		const newSegmentName = generateLogSegmentName(this.epoch, ".compacted.seg")
+		const newSegment: SegmentMetadata = {
+			name: newSegmentName,
+			firstOffset: segmentWindow[0].firstOffset,
+			lastOffset: segmentWindow[segmentWindow.length - 1].lastOffset,
+			createdMS: Date.now(),
+			records: segmentWindow.reduce((acc, s) => acc + s.records, 0),
+			bytes: segmentWindow.reduce((acc, s) => acc + s.bytes, 0),
+		}
+
+		// transaction to update log segments and store tombstones
+		// if we crash here it's ok since we recover the tree
+		await this.ctx.storage.transaction(async (tx) => {
+			for (const segment of segmentWindow) {
+				await tx.delete(buildLogSegmentIndexKey(segment.name))
+				await tx.put(buildTombstoneKey(segment.name), JSON.stringify(segment))
+			}
+			await tx.put(buildLogSegmentIndexKey(newSegment.name), JSON.stringify(newSegment))
+		})
+
+		// grab tree lock and update the tree
+		await this.treeMutex.runExclusive(async () => {
+			for (const segment of segmentWindow) {
+				this.tree.remove(segment)
+			}
+			this.tree.insert(newSegment)
+		})
 	}
 
 	async cleanTombstones() {

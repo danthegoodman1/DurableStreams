@@ -5,7 +5,7 @@ import type { ProduceResponse, GetMessagesResponse } from "../src/index"
 import { RBTree } from "bintrees"
 import { SegmentMetadata, calculateCompactWindow } from "../src/segment"
 
-describe.skip("Worker", () => {
+describe("Worker", () => {
 	let worker: Unstable_DevWorker
 
 	beforeAll(async () => {
