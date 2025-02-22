@@ -15,7 +15,7 @@ Therefore if you want to read from a specific point in time, like now - 30 days,
 
 ### Compaction settings
 
-Because Durable Objects are limited to 128MB, we have to be mindful of memory. The largest use of memory will be the segment metadata index. As a result, when your stream grows (really large) in size, you'll have to start increasing the compaction threshold to reduce the number of total segments, thus reducing memory usage. It's safe to adjust compaction settings on the fly by redeploying, but at the moment there's no way to change it for a single stream (see GH issue).
+Because Durable Objects are limited to 128MB, we have to be mindful of memory. The largest use of memory (beyond pending writes) will be the segment metadata index. As a result, when your stream grows (really large) in size, you'll have to start increasing the compaction threshold to reduce the number of total segments, thus reducing memory usage. It's safe to adjust compaction settings on the fly by redeploying, but at the moment there's no way to change it for a single stream (see GH issue).
 
 ## Difference from Workers PubSub and Workers Queues
 
