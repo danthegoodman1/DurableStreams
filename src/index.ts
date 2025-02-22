@@ -437,7 +437,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		const release = await this.treeMutex.acquire()
 		try {
 			const segmentWindow = calculateCompactWindow(this.tree)
-
+			console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => s.name).join(", ")}`)
 			if (segmentWindow.length < 2) {
 				// We don't have enough segments to compact, so we can't compact
 				console.debug("not enough segments to compact after iteration, exiting")
