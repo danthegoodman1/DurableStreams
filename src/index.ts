@@ -22,8 +22,6 @@ const OrphanPurgingChance = 0.0001
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 const tombstoneKey = "tombstone::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 
-const zeroOffset = "00000000000000000000000000000000"
-
 function buildLogSegmentIndexKey(segmentName: string): string {
 	return `${activeLogSegmentKey}${segmentName}`
 }
