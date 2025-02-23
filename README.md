@@ -1,5 +1,7 @@
 # DurableStreams
 
+Durable bottomless log streams with Cloudflare Durable Objects and R2.
+
 ## Usage (WIP)
 
 ### Segment sizes
@@ -53,6 +55,15 @@ If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer tha
 ### Isn't this just effectively a batching NDJSON merge engine, with a monotonic hybrid clock?
 
 Yes. That's effectively what streams are. Sometimes they have extra features like managed consumer groups too :P
+
+### Why not Postgres with BIGSERIAL/SEQUENCE?
+
+Because that's not:
+
+1. Horizontally scalable (at least not nearly as easily)
+2. Requires Postgres
+3. Doesn't allow you to start by time (see [reading from a point in time](#reading-from-a-point-in-time))
+4. Not bottomless
 
 ### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets, and you added a clock for ordering?
 
