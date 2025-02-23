@@ -187,17 +187,13 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		const url = new URL(request.url)
-		const consumerID = url.searchParams.get("consumer_id")
-		if (!consumerID) {
-			return new Response("Missing consumer_id query parameter", { status: 400 })
-		}
 
 		const offset = url.searchParams.get("offset")
 		const limit = url.searchParams.get("limit")
 		const timeout_sec = url.searchParams.get("timeout_sec")
 
 		const payload: GetMessagesRequest = {
-			consumerID,
+			consumerID: crypto.randomUUID(),
 			offset: offset ?? "",
 			limit: Number(limit) ?? 10, // low default avoid OOM
 			timeout_sec: Number(timeout_sec) ?? 10,
