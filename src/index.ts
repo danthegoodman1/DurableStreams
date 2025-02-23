@@ -14,7 +14,7 @@ import { Mutex } from "async-mutex"
 const FlushIntervalMs = 200
 const hour = 1000 * 60 * 60
 const day = hour * 24
-const MaxStaleSegmentMs = day * 1
+const MaxTombstoneAgeMs = day * 1
 const CompactLogSegmentsChance = 1 // temp for testing
 const CleanTombstonesChance = 0.01
 const OrphanPurgingChance = 0.0001
@@ -454,7 +454,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	// Tree must be locked before calling this
 	async writeLogSegmentMetadata(metadata: SegmentMetadata) {
 		// First we need to durably store it
-		await this.ctx.storage.put(buildLogSegmentIndexKey(metadata.name), JSON.stringify(metadata))
+		await this.ctx.storage.put(buildLogSegmentIndexKey(metadata.name), metadata)
 		// Then we can add it to the memory index
 		this.tree.insert(metadata)
 	}
@@ -522,9 +522,9 @@ export class StreamCoordinator extends DurableObject<Env> {
 		await this.ctx.storage.transaction(async (tx) => {
 			for (const segment of segmentWindow) {
 				await tx.delete(buildLogSegmentIndexKey(segment.name))
-				await tx.put(buildTombstoneKey(segment.name), JSON.stringify(segment))
+				await tx.put(buildTombstoneKey(segment.name), segment)
 			}
-			await tx.put(buildLogSegmentIndexKey(newSegment.name), JSON.stringify(newSegment))
+			await tx.put(buildLogSegmentIndexKey(newSegment.name), newSegment)
 		})
 
 		// grab tree lock and update the tree
@@ -545,9 +545,23 @@ export class StreamCoordinator extends DurableObject<Env> {
 
 		console.debug("cleaning tombstones")
 
-		// TODO: get snapshot of what segments are active
-		// TODO: list R2 to find non-active segments that are older than the retention policy
-		// TODO: delete the segments from R2
+		const items = await this.ctx.storage.list<SegmentMetadata>({
+			prefix: tombstoneKey,
+		})
+		const now = Date.now()
+		for (const [_, item] of items) {
+			if (item.createdMS < now - MaxTombstoneAgeMs) {
+				console.debug(`Deleting tombstone ${item.name}`)
+				// Delete it from R2
+				try {
+					await this.env.StreamData.delete(generateLogSegmentPath(this.streamName, item.name))
+				} catch (error) {
+					console.error(`Error deleting tombstone ${item.name} from R2, did it already get deleted?`, error)
+				}
+
+				await this.ctx.storage.delete(buildTombstoneKey(item.name))
+			}
+		}
 	}
 
 	async purgeOrphans() {
