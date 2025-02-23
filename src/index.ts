@@ -249,8 +249,6 @@ export class StreamCoordinator extends DurableObject<Env> {
 			})
 		}
 
-		// If we have a "-" offset and no records, we need to long poll
-
 		// For long polling, capture the current lastOffset as the starting point.
 		const emitter = new EventEmitter<{ records: [Record[]] }>()
 		this.consumers.set(payload.consumerID, { emitter, limit: payload.limit })
