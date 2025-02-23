@@ -559,6 +559,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 					console.error(`Error deleting tombstone ${item.name} from R2, did it already get deleted?`, error)
 				}
 
+				// Delete it from the tombstone index
 				await this.ctx.storage.delete(buildTombstoneKey(item.name))
 			}
 		}
