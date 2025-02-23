@@ -6,6 +6,10 @@ Durable bottomless log streams with Cloudflare Durable Objects and R2.
 
 In the meantime, check the tests.
 
+### Auth header
+
+You can set the `AUTH_HEADER` env var. If set, requests will be checked for a matching value in the `auth` header.
+
 ### Segment sizes
 
 You want to think of a segment size in terms of a row group for parquet: Every time you look up a batch of records, or a single record, it's going to pull at least one segment, so it should be relatively fast to get that even if it's the last segment.

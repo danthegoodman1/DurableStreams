@@ -166,6 +166,10 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		if (this.env.AUTH_HEADER && request.headers.get("auth") !== this.env.AUTH_HEADER) {
+			return new Response("Unauthorized", { status: 401 })
+		}
+
 		console.log("fetch", request.url, request.method)
 		if (!this.streamName) {
 			// Set it if we don't have it yet

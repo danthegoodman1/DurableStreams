@@ -3,4 +3,5 @@
 interface Env {
 	StreamCoordinator: DurableObjectNamespace<import("./src/index").StreamCoordinator>
 	StreamData: R2Bucket
+	AUTH_HEADER?: string
 }
