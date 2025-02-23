@@ -552,7 +552,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		for (const [_, item] of items) {
 			if (item.createdMS < now - MaxTombstoneAgeMs) {
 				console.debug(`Deleting tombstone ${item.name}`)
-				// Delete it from R2
+				// Delete it from R2 first to make sure we do it
 				try {
 					await this.env.StreamData.delete(generateLogSegmentPath(this.streamName, item.name))
 				} catch (error) {
