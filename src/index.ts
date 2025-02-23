@@ -260,6 +260,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		])
 
 		if (res instanceof Error) {
+			// Remove the emitter from the consumers map
+			this.consumers.delete(payload.consumerID)
 			return new Response(JSON.stringify({ records: [] } as GetMessagesResponse), {
 				status: 200,
 			})
