@@ -1,5 +1,7 @@
 # DurableStreams
 
+Durable bottomless log streams with Cloudflare Durable Objects and R2.
+
 ## Usage (WIP)
 
 ### Segment sizes
@@ -12,6 +14,10 @@ Stream offsets are 32 bytes, where the first 16 bytes are the zero-padded epoch 
 flushed to storage, and the second 16 bytes being a 128-bit incrementing counter (it's probably impossible that this ever exceeds tens of thousands unless you have a massive epoch interval).
 
 Therefore if you want to read from a specific point in time, like now - 30 days, you could join a zero-padded now-30d unix milliseconds with 16 `0`'s to generate a timestamp like `00017399959663730000000000000000`. That will represent all logs _flushed_ after that time, so you may want to additionally subtract your flush interval (or a few) to be safe.
+
+### Compaction settings
+
+Because Durable Objects are limited to 128MB, we have to be mindful of memory. The largest use of memory (beyond pending writes) will be the segment metadata index. As a result, when your stream grows (really large) in size, you'll have to start increasing the compaction threshold to reduce the number of total segments, thus reducing memory usage. It's safe to adjust compaction settings on the fly by redeploying, but at the moment there's no way to change it for a single stream (see GH issue).
 
 ## Difference from Workers PubSub and Workers Queues
 
@@ -49,6 +55,15 @@ If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer tha
 ### Isn't this just effectively a batching NDJSON merge engine, with a monotonic hybrid clock?
 
 Yes. That's effectively what streams are. Sometimes they have extra features like managed consumer groups too :P
+
+### Why not Postgres with BIGSERIAL/SEQUENCE?
+
+Because that's not:
+
+1. Horizontally scalable (at least not nearly as easily)
+2. Requires Postgres
+3. Doesn't allow you to start by time (see [reading from a point in time](#reading-from-a-point-in-time))
+4. Not bottomless
 
 ### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets, and you added a clock for ordering?
 
