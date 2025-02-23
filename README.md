@@ -64,6 +64,8 @@ Because that's not:
 2. Requires Postgres
 3. Doesn't allow you to start by time (see [reading from a point in time](#reading-from-a-point-in-time))
 4. Not bottomless
+5. Manual setup of every unique stream
+6. Less convenient than HTTP requests
 
 ### But wait then isn't this effectively [IceDB](https://github.com/danthegoodman1/icedb/), which is a parquet merge engine in S3 but NDJSON, if you're having consumers track their own offsets, and you added a clock for ordering?
 
