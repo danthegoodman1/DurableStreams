@@ -2,9 +2,11 @@
 
 Durable bottomless log streams with Cloudflare Durable Objects and R2.
 
-## Usage (WIP)
+## Usage
 
-The name of the stream is determined by the path at which you publish and consume from. A consumer is permitted to begin consuming (e.g. long-poll for new records) before publishing begins
+The name of the stream is determined by the path at which you publish and consume from. A consumer is permitted to begin consuming (e.g. long-poll for new records) before publishing begins.
+
+Also check the tests, they're digestible and cover lots of features.
 
 ### Publishing
 
