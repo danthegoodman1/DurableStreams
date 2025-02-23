@@ -4,11 +4,48 @@ Durable bottomless log streams with Cloudflare Durable Objects and R2.
 
 ## Usage (WIP)
 
-In the meantime, check the tests.
+The name of the stream is determined by the path at which you publish and consume from. A consumer is permitted to begin consuming (e.g. long-poll for new records) before publishing begins
+
+### Publishing
+
+Publishing records is as simple as making a POST request with a JSON body:
+
+```
+curl -X POST "https://your-worker.example.com/your-stream-name" \
+  -H "Content-Type: application/json" \
+  -H "auth: YOUR_AUTH_HEADER" \
+  -d '{
+    "records": [
+      {"key": "value1"},
+      {"key": "value2"}
+    ]
+  }'
+```
+
+### Consuming
+
+To consume messages, perform a GET request to the stream:
+
+```
+curl "https://your-worker.example.com/your-stream-name?offset=-&limit=5&timeout_sec=10" \
+  -H "auth: YOUR_AUTH_HEADER"
+```
+
+#### Parameters
+
+- `offset`: The record offset to start from. Use `-` to request messages from the beginning, and leave blank to long-poll for the next message batch produced. If you use a `-` offset, and no messages have been produced yet, it will fall back to long-polling.
+- `limit`: The maximum number of records to return, default `10`.
+- `timeout_sec`: Duration the request will long-poll before returning, default `10`.
 
 ### Auth header
 
 You can set the `AUTH_HEADER` env var. If set, requests will be checked for a matching value in the `auth` header.
+
+### Flush interval
+
+By default, published records are stacked in memory and flushed on an interval. This helps increase throughput and reduce the number of segments created at the expense of memory usage.
+
+Depending on how often you write, and how large your records are, you may need to adjust this, or even go as far as make stream shards (stream-1, stream-2, etc.)
 
 ### Segment sizes
 
