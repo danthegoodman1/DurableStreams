@@ -33,7 +33,7 @@ You need streams if you want a log that can persist for long durations, and hand
 
 It's more like Redis streams, without the consumer group.
 
-### Publish is not socketed
+### Based on requests, not persistent connections
 
 This makes it easier to quickly publish messages and go away. You don't need to set up and manage a connection.
 
