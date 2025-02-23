@@ -242,12 +242,18 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async handleGetMessagesRequest(payload: GetMessagesRequest): Promise<Response> {
+		let records: Record[] = []
 		if (payload.offset) {
-			const records = await this.getMessagesFromOffset(payload.offset, payload.limit)
+			records = await this.getMessagesFromOffset(payload.offset, payload.limit)
+		}
+
+		if ((payload.offset && payload.offset !== "-") || records.length > 0) {
 			return new Response(JSON.stringify({ records } as GetMessagesResponse), {
 				status: 200,
 			})
 		}
+
+		// If we have a "-" offset and no records, we need to long poll
 
 		// For long polling, capture the current lastOffset as the starting point.
 		const emitter = new EventEmitter<{ records: [Record[]] }>()
