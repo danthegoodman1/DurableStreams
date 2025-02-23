@@ -33,11 +33,26 @@ curl "https://your-worker.example.com/your-stream-name?offset=-&limit=5&timeout_
   -H "auth: YOUR_AUTH_HEADER"
 ```
 
+Records will come back with:
+
+```ts
+export interface GetMessagesResponse {
+	records: Record[]
+}
+
+export interface Record {
+	offset: string
+	data: any
+}
+```
+
+If you make a subsequent request to consume from the offset
+
 #### Parameters
 
-- `offset`: The record offset to start from. Use `-` to request messages from the beginning, and leave blank to long-poll for the next message batch produced. If you use a `-` offset, and no messages have been produced yet, it will fall back to long-polling.
+- `offset`: The record offset to start from. Use `-` to request messages from the beginning, and leave blank to long-poll for the next message batch produced.
 - `limit`: The maximum number of records to return, default `10`.
-- `timeout_sec`: Duration the request will long-poll before returning, default `10`.
+- `timeout_sec`: Duration the request will long-poll before returning if no records are found, default `0` (return immediately).
 
 ### Auth header
 

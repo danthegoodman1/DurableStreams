@@ -196,7 +196,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 			consumerID: crypto.randomUUID(),
 			offset: offset ?? "",
 			limit: Number(limit) ?? 10, // low default avoid OOM
-			timeout_sec: Number(timeout_sec) ?? 10,
+			timeout_sec: Number(timeout_sec) ?? 0,
 		}
 
 		return this.handleGetMessagesRequest(payload)
@@ -243,7 +243,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 			records = await this.getMessagesFromOffset(payload.offset, payload.limit)
 		}
 
-		if ((payload.offset && payload.offset !== "-") || records.length > 0) {
+		if (!payload.timeout_sec || records.length > 0) {
 			return new Response(JSON.stringify({ records } as GetMessagesResponse), {
 				status: 200,
 			})
