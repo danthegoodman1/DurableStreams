@@ -501,6 +501,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		// Begin the k-way merge: this will write records from all segments in order.
+		// Technically this is not needed because the segments are already in order :shrug:
 		const mergePromise = kWayMerge(
 			readers.map((r) => readLines(r!.body)),
 			writer
