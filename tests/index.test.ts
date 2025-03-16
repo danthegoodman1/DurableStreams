@@ -296,6 +296,56 @@ describe("Worker", () => {
 			expect(consumerData.records[3].data.value).toBe("msg4")
 		})
 	})
+
+	describe("StreamManager - Destroy", () => {
+		it("should properly destroy a stream and all associated data", async () => {
+			// Create a unique stream name
+			const streamName = crypto.randomUUID()
+
+			// 1. Produce messages to create data in the stream
+			const produceResp = await worker.fetch(`http://example.com/${streamName}`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "data1" }, { value: "data2" }, { value: "data3" }],
+				}),
+			})
+			expect(produceResp.status).toBe(200)
+
+			// Verify we can consume the messages
+			const consumeResp1 = await worker.fetch(`http://example.com/${streamName}?consumer_id=destroyTest&offset=-&limit=10`)
+			expect(consumeResp1.status).toBe(200)
+			const consumeData1 = (await consumeResp1.json()) as GetMessagesResponse
+			expect(consumeData1.records.length).toBe(3)
+
+			// 2. Call destroy on the stream
+			const destroyResp = await worker.fetch(`http://example.com/${streamName}`, {
+				method: "DELETE",
+			})
+			expect(destroyResp.status).toBe(200)
+
+			// 3. Verify the stream is empty by trying to consume from it again
+			const consumeResp2 = await worker.fetch(`http://example.com/${streamName}?consumer_id=destroyTestAfter&offset=-&limit=10`)
+			expect(consumeResp2.status).toBe(200)
+			const consumeData2 = (await consumeResp2.json()) as GetMessagesResponse
+			expect(consumeData2.records.length).toBe(0)
+
+			// 4. Verify we can create a new stream with the same name
+			const produceResp2 = await worker.fetch(`http://example.com/${streamName}`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "newdata" }],
+				}),
+			})
+			expect(produceResp2.status).toBe(200)
+
+			// 5. Verify we can consume from the newly created stream
+			const consumeResp3 = await worker.fetch(`http://example.com/${streamName}?consumer_id=destroyTestNew&offset=-&limit=10`)
+			expect(consumeResp3.status).toBe(200)
+			const consumeData3 = (await consumeResp3.json()) as GetMessagesResponse
+			expect(consumeData3.records.length).toBe(1)
+			expect(consumeData3.records[0].data.value).toBe("newdata")
+		})
+	})
 })
 
 describe("calculateCompactWindow", () => {
