@@ -1,6 +1,6 @@
 # DurableStreams
 
-Durable bottomless log streams with Cloudflare Durable Objects and R2.
+Durable bottomless event streaming with Cloudflare Durable Objects and R2.
 
 ## Usage
 
@@ -70,10 +70,10 @@ You want to think of a segment size in terms of a row group for parquet: Every t
 
 ### Reading from a point in time
 
-Stream offsets are 32 bytes, where the first 16 bytes are the zero-padded epoch interval when the log was
+Stream offsets are 32 bytes, where the first 16 bytes are the zero-padded epoch interval when the event was
 flushed to storage, and the second 16 bytes being a 128-bit incrementing counter (it's probably impossible that this ever exceeds tens of thousands unless you have a massive epoch interval).
 
-Therefore if you want to read from a specific point in time, like now - 30 days, you could join a zero-padded now-30d unix milliseconds with 16 `0`'s to generate a timestamp like `00017399959663730000000000000000`. That will represent all logs _flushed_ after that time, so you may want to additionally subtract your flush interval (or a few) to be safe.
+Therefore if you want to read from a specific point in time, like now - 30 days, you could join a zero-padded now-30d unix milliseconds with 16 `0`'s to generate a timestamp like `00017399959663730000000000000000`. That will represent all events _flushed_ after that time, so you may want to additionally subtract your flush interval (or a few) to be safe.
 
 ### Compaction settings
 
@@ -85,7 +85,7 @@ It's a funadamentally different model, that same reason you'd use Kafka over Rab
 
 PubSub doesn't hold an infinite history, and queues don't let consumers operate in full isolation (nor have infinite history).
 
-You need streams if you want a log that can persist for long durations, and handle starting consuming from 3 months ago.
+You need streams if you want a event that can persist for long durations, and handle starting consuming from 3 months ago.
 
 ## Differences from Kafka-like systems
 
