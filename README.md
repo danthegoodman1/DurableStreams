@@ -118,6 +118,16 @@ If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer tha
 
 ## Other notes
 
+### Limitations
+
+The major limitation is Durable Objects are limited to 128MB of memory.
+
+As a result, many possible performance optimizations have been dropped in favor of reducing memory overhead (e.g. purging oprhans doing per-object double KV lookups).
+
+You also have to keep in mind the 50GB total storage limit for KV for Durable Objects, which can be raised by contacting Cloudflare, but it's unknown at this time whether you'd get a notification, or just hit some hard wall.
+
+There's obviously a per-stream performance limit, however as mentioned in other sections, you can just horizontally scale as needed (assuming your workload can handle ordering at the partition level).
+
 ### Isn't this just effectively a batching NDJSON merge engine, with a monotonic hybrid clock?
 
 Yes. That's effectively what streams are. Sometimes they have extra features like managed consumer groups too :P
