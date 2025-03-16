@@ -1,7 +1,7 @@
 import { unstable_dev } from "wrangler"
 import type { Unstable_DevWorker } from "wrangler"
 import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest"
-import type { ProduceResponse, GetMessagesResponse } from "../src/index"
+import type { ProduceResponse, GetMessagesResponse } from "../src/stream"
 import { RBTree } from "bintrees"
 import { SegmentMetadata, calculateCompactWindow } from "../src/segment"
 
@@ -52,7 +52,7 @@ describe("Worker", () => {
 	// 1. Get messages from the oldest offset (using "-" as the offset)
 	// 2. Get messages starting from a provided offset
 	// 3. Long-poll for new messages and receive them immediately when produced
-	describe("StreamCoordinator - Consumer", () => {
+	describe("StreamManager - Consumer", () => {
 		it("should allow a consumer to get messages from the oldest offset with a limit", async () => {
 			// Create a unique stream name
 			const streamName = crypto.randomUUID()
@@ -177,7 +177,7 @@ describe("Worker", () => {
 		})
 	})
 
-	describe("StreamCoordinator - Merge", () => {
+	describe("StreamManager - Merge", () => {
 		it("should merge segments and return merged records", async () => {
 			const streamName = crypto.randomUUID()
 
@@ -221,7 +221,7 @@ describe("Worker", () => {
 		})
 	})
 
-	describe("StreamCoordinator - Producer Versioning", () => {
+	describe("StreamManager - Producer Versioning", () => {
 		it("should handle producer versioning correctly", async () => {
 			const streamName = crypto.randomUUID()
 
