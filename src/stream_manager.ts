@@ -742,63 +742,7 @@ export class StreamManager extends DurableObject<Env> {
 			cursor = r2Objects.truncated ? r2Objects.objects[r2Objects.objects.length - 1].key : undefined
 		} while (cursor)
 
-		// Process storage deletions in batches to avoid memory pressure
-		const BATCH_SIZE = 50
-
-		// Delete active segments in batches
-		let activeCursor: string | undefined = undefined
-		do {
-			const activeSegmentsBatch: Map<string, SegmentMetadata> = await this.ctx.storage.list<SegmentMetadata>({
-				prefix: activeLogSegmentKey,
-				limit: BATCH_SIZE,
-				startAfter: activeCursor,
-			})
-
-			// Delete this batch in a transaction
-			if (activeSegmentsBatch.size > 0) {
-				await this.ctx.storage.transaction(async (tx) => {
-					for (const [key] of activeSegmentsBatch) {
-						await tx.delete(key)
-					}
-				})
-			}
-
-			// Get the last key for pagination
-			let lastKey: string | undefined = undefined
-			for (const [k] of activeSegmentsBatch) {
-				lastKey = k
-			}
-			activeCursor = lastKey ? lastKey + "\0" : undefined
-		} while (activeCursor)
-
-		// Delete tombstones in batches
-		let tombstoneCursor: string | undefined = undefined
-		do {
-			const tombstonesBatch: Map<string, SegmentMetadata> = await this.ctx.storage.list<SegmentMetadata>({
-				prefix: tombstoneKey,
-				limit: BATCH_SIZE,
-				startAfter: tombstoneCursor,
-			})
-
-			// Delete this batch in a transaction
-			if (tombstonesBatch.size > 0) {
-				await this.ctx.storage.transaction(async (tx) => {
-					for (const [key] of tombstonesBatch) {
-						await tx.delete(key)
-					}
-				})
-			}
-
-			// Get the last key for pagination
-			let lastKey: string | undefined = undefined
-			for (const [k] of tombstonesBatch) {
-				lastKey = k
-			}
-			tombstoneCursor = lastKey ? lastKey + "\0" : undefined
-		} while (tombstoneCursor)
-
-		// Delete stream metadata
-		await this.ctx.storage.delete(metadataKey)
+		await this.ctx.storage.deleteAll()
 
 		// Clear in-memory state
 		await this.treeMutex.runExclusive(() => {
