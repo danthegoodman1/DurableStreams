@@ -91,6 +91,10 @@ You need streams if you want a log that can persist for long durations, and hand
 
 It's more like Redis streams, without the consumer group.
 
+You can build Kafka-like semantics on top as needed.
+
+The TLDR is you can think of a Durable Stream as a single Kafka partition with its own timestamp oracle. If you want offset persistence, consumer groups, etc. you can build that as a layer on top (possible also with Durable Objects).
+
 ### Based on requests, not persistent connections
 
 This makes it easier to quickly publish messages and go away. You don't need to set up and manage a connection.
