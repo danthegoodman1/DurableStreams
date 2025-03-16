@@ -5,6 +5,12 @@ import type { ProduceResponse, GetMessagesResponse } from "../src/index"
 import { RBTree } from "bintrees"
 import { SegmentMetadata, calculateCompactWindow } from "../src/segment"
 
+interface VersionErrorResponse {
+	error: string
+	current_version?: number
+	provided_version?: number
+}
+
 describe("Worker", () => {
 	let worker: Unstable_DevWorker
 
@@ -212,6 +218,82 @@ describe("Worker", () => {
 			expect(consumerData.records[2].data.value).toBe("c")
 			expect(consumerData.records[3].data.value).toBe("d")
 			expect(consumerData.records[4].data.value).toBe("e")
+		})
+	})
+
+	describe("StreamCoordinator - Producer Versioning", () => {
+		it("should handle producer versioning correctly", async () => {
+			const streamName = crypto.randomUUID()
+
+			// First produce with version 1
+			const produceResp1 = await worker.fetch(`http://example.com/${streamName}?version=1`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "msg1" }],
+				}),
+			})
+			expect(produceResp1.status).toBe(200)
+
+			// Produce with version 2 should succeed
+			const produceResp2 = await worker.fetch(`http://example.com/${streamName}?version=2`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "msg2" }],
+				}),
+			})
+			expect(produceResp2.status).toBe(200)
+
+			// Produce with version 2 again should succeed
+			const produceResp2_2 = await worker.fetch(`http://example.com/${streamName}?version=2`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "msg2_2" }],
+				}),
+			})
+			expect(produceResp2_2.status).toBe(200)
+
+			// Produce with version 1 should fail (older version)
+			const produceResp3 = await worker.fetch(`http://example.com/${streamName}?version=1`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "msg3" }],
+				}),
+			})
+			expect(produceResp3.status).toBe(409)
+			const errorData = (await produceResp3.json()) as VersionErrorResponse
+			expect(errorData.error).toBe("Producer version too old")
+			expect(errorData.current_version).toBe(2)
+			expect(errorData.provided_version).toBe(1)
+
+			// Produce without version should succeed (opt-in)
+			const produceResp4 = await worker.fetch(`http://example.com/${streamName}`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "msg4" }],
+				}),
+			})
+			expect(produceResp4.status).toBe(200)
+
+			// Invalid version should fail
+			const produceResp5 = await worker.fetch(`http://example.com/${streamName}?version=invalid`, {
+				method: "POST",
+				body: JSON.stringify({
+					records: [{ value: "msg5" }],
+				}),
+			})
+			expect(produceResp5.status).toBe(400)
+			const invalidData = (await produceResp5.json()) as VersionErrorResponse
+			expect(invalidData.error).toBe("Invalid version parameter")
+
+			// Verify we can read all successfully produced messages
+			const consumerResp = await worker.fetch(`http://example.com/${streamName}?consumer_id=versionTest&offset=-&limit=10`)
+			expect(consumerResp.status).toBe(200)
+			const consumerData = (await consumerResp.json()) as GetMessagesResponse
+			expect(consumerData.records).toHaveLength(4)
+			expect(consumerData.records[0].data.value).toBe("msg1")
+			expect(consumerData.records[1].data.value).toBe("msg2")
+			expect(consumerData.records[2].data.value).toBe("msg2_2")
+			expect(consumerData.records[3].data.value).toBe("msg4")
 		})
 	})
 })

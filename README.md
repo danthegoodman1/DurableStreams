@@ -24,6 +24,38 @@ curl -X POST "https://your-worker.example.com/your-stream-name" \
   }'
 ```
 
+#### Publish version (fencing token)
+
+You can optionally include a version parameter when publishing to implement fencing tokens or leader election:
+
+```
+curl -X POST "https://your-worker.example.com/your-stream-name?version=1" \
+  -H "Content-Type: application/json" \
+  -H "auth: YOUR_AUTH_HEADER" \
+  -d '{
+    "records": []
+  }'
+```
+
+The version acts as a fencing token:
+
+- Must be a number
+- Only allows writes if version >= current version
+- Updates stored version when a higher version is provided
+- Returns 409 if version < current version
+- Optional - if not provided, writes are always allowed
+
+This is useful for:
+
+- Preventing stale/zombie producers from writing
+- Handling changes in higher-level partition rebalancing (prevent producers from writing to the wrong partition during inconsistency window of producer and partition count)
+
+You can choose to omit records when publishing to purely increment the producer version, which can be used between creating the new partition (and making it available for discovery), and before pushing updates down the publishers, to consistently handle rebalancing. That will return the following JSON response:
+
+```
+{ version: this.metadata.producer_version }
+```
+
 ### Consuming
 
 To consume messages, perform a GET request to the stream:
