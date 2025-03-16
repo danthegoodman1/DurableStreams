@@ -585,11 +585,39 @@ export class StreamCoordinator extends DurableObject<Env> {
 			return
 		}
 
-		// TODO: list through all files in R2
-		// TODO: check if the files exist in the KV or the tombstones
-		// TODO: if none, log warning and delete the file from R2
-
 		console.debug("purging orphans")
+
+		// Use cursor-based pagination to iterate through R2 objects
+		let cursor: string | undefined = undefined
+		do {
+			// Get a batch of objects from R2
+			const r2Objects = await this.env.StreamData.list({
+				prefix: `${this.streamName}/`,
+				cursor,
+				limit: 100, // Process in reasonable chunks
+			})
+
+			// Process this batch
+			for (const obj of r2Objects.objects) {
+				// Extract segment name from the R2 key
+				const segmentPath = obj.key
+				const segmentName = segmentPath.split("/").pop()!
+
+				// Check if this segment exists in either active segments or tombstones
+				const [activeMetadata, tombstoneMetadata] = await Promise.all([
+					this.ctx.storage.get<SegmentMetadata>(buildLogSegmentIndexKey(segmentName)),
+					this.ctx.storage.get<SegmentMetadata>(buildTombstoneKey(segmentName)),
+				])
+
+				if (!activeMetadata && !tombstoneMetadata) {
+					console.info(`Found orphaned R2 object: ${obj.key} - deleting`)
+					await this.env.StreamData.delete(obj.key)
+				}
+			}
+
+			// Get cursor for next batch
+			cursor = r2Objects.truncated ? r2Objects.objects[r2Objects.objects.length - 1].key : undefined
+		} while (cursor)
 	}
 
 	// This helper function returns the SegmentMetadata that will contain the first offset AFTER the given offset
