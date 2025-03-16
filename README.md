@@ -95,6 +95,8 @@ You can build Kafka-like semantics on top as needed.
 
 The TLDR is you can think of a Durable Stream as a single Kafka partition with its own timestamp oracle. If you want offset persistence, consumer groups, etc. you can build that as a layer on top (possible also with Durable Objects).
 
+The really awesome thing about Durable Streams is exactly that isolation: if you need more partitions, just make more! You're only going to be scale-bound by the system that talks to the Durable Streams, not each stream itself, because of that horizontal scalability.
+
 ### Based on requests, not persistent connections
 
 This makes it easier to quickly publish messages and go away. You don't need to set up and manage a connection.
