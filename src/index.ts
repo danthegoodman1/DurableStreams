@@ -500,18 +500,28 @@ export class StreamCoordinator extends DurableObject<Env> {
 			}
 		}
 
-		// Begin the k-way merge: this will write records from all segments in order.
-		// Technically this is not needed because the segments are already in order :shrug:
-		const mergePromise = kWayMerge(
-			readers.map((r) => readLines(r!.body)),
-			writer
-		)
+		// We can write each segment sequentially since they're contiguous and ordered
+		const processPromise = async () => {
+			try {
+				for (const reader of readers) {
+					if (!reader) continue
 
-		// Wait for the merge to finish (which in turn closes the writer)
-		await mergePromise
+					// Process each line from the current segment and write directly to the output
+					for await (const line of readLines(reader.body)) {
+						const buffer = new TextEncoder().encode(line + "\n")
+						await writer.write(buffer)
+					}
+				}
+			} finally {
+				await writer.close()
+			}
+		}
+
+		// Start processing segments sequentially
+		const mergePromise = processPromise()
 
 		// Finally, wait for the record to be persisted to R2.
-		await writePromise
+		await Promise.all([mergePromise, writePromise])
 
 		const newSegment: SegmentMetadata = {
 			name: newSegmentName,
