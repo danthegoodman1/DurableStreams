@@ -33,7 +33,7 @@ curl -X POST "https://your-worker.example.com/your-stream-name?version=1" \
   -H "Content-Type: application/json" \
   -H "auth: YOUR_AUTH_HEADER" \
   -d '{
-    "records": [{"key": "value1"}]
+    "records": []
   }'
 ```
 
@@ -49,6 +49,12 @@ This is useful for:
 
 - Preventing stale/zombie producers from writing
 - Handling changes in higher-level partition rebalancing (prevent producers from writing to the wrong partition during inconsistency window of producer and partition count)
+
+You can choose to omit records when publishing to purely increment the producer version, which can be used between creating the new partition (and making it available for discovery), and before pushing updates down the publishers, to consistently handle rebalancing. That will return the following JSON response:
+
+```
+{ version: this.metadata.producer_version }
+```
 
 ### Consuming
 

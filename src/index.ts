@@ -257,6 +257,11 @@ export class StreamCoordinator extends DurableObject<Env> {
 			}
 		}
 
+		if (body.records.length === 0) {
+			// We probably just incremented the version
+			return new Response(JSON.stringify({ version: this.metadata.producer_version }), { status: 200 })
+		}
+
 		// Submit for persistence and wait
 		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
 		this.pendingMessages.push({ emitter, records: body.records.map((r) => JSON.stringify(r)) })
