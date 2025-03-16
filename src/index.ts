@@ -1,5 +1,5 @@
 // Need to export DO classes from here
-export { StreamManager } from "./stream"
+export { StreamManager } from "./stream_manager"
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
