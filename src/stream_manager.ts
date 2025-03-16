@@ -720,7 +720,7 @@ export class StreamManager extends DurableObject<Env> {
 	 * Delete the stream and all associated data
 	 */
 	async destroy() {
-		console.warn(`Destroying stream ${this.streamName}`)
+		console.log(`Destroying stream ${this.streamName}`)
 
 		// Cancel any pending operations
 		this.pendingMessages = []
