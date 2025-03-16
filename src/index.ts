@@ -21,6 +21,7 @@ const OrphanPurgingChance = 0.0001
 
 const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
 const tombstoneKey = "tombstone::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
+const metadataKey = "_metadata" // stream metadata like producer version
 
 function buildLogSegmentIndexKey(segmentName: string): string {
 	return `${activeLogSegmentKey}${segmentName}`
@@ -65,6 +66,13 @@ export interface ProduceResponse {
 	offsets: string[][]
 }
 
+export interface StreamMetadata {
+	/**
+	 * This is an optional version that the producer can use as a fencing token for higher-level coordination.
+	 */
+	producer_version: number
+}
+
 function parseOffset(offset: string): { epoch: number; counter: number } {
 	const epoch = offset.slice(0, 16)
 	const counter = offset.slice(16)
@@ -83,6 +91,7 @@ export class StreamCoordinator extends DurableObject<Env> {
 	streamName: string = ""
 	epoch: number = Date.now()
 	counter: number = 0
+	metadata: StreamMetadata = { producer_version: 0 }
 
 	tree: RBTree<SegmentMetadata>
 	treeMutex = new Mutex()
@@ -141,6 +150,12 @@ export class StreamCoordinator extends DurableObject<Env> {
 			// We are the first instance to start up, so we need to do the setup
 			this.setup_listener = new EventEmitter<{ finish: [] }>()
 
+			// Load metadata first
+			const storedMetadata = await this.ctx.storage.get<StreamMetadata>(metadataKey)
+			if (storedMetadata) {
+				this.metadata = storedMetadata
+			}
+
 			console.log("Building index from storage")
 			await this.buildIndexFromStorage()
 
@@ -169,10 +184,8 @@ export class StreamCoordinator extends DurableObject<Env> {
 		}
 
 		console.log("fetch", request.url, request.method)
-		if (!this.streamName) {
-			// Set it if we don't have it yet
-			this.streamName = new URL(request.url).pathname
-		}
+		// Always set streamName from the URL first
+		this.streamName = new URL(request.url).pathname
 
 		if (!this.setup) {
 			await this.ensureSetup()
@@ -210,7 +223,39 @@ export class StreamCoordinator extends DurableObject<Env> {
 	}
 
 	async handleProduce(request: Request): Promise<Response> {
-		const body: ProduceBody = await request.json()
+		// Read the body first before doing anything else
+		let body: ProduceBody
+		try {
+			body = await request.json()
+		} catch (e) {
+			return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400 })
+		}
+
+		const url = new URL(request.url)
+		const version = url.searchParams.get("version")
+
+		// If version is provided, check it against current producer version
+		if (version !== null) {
+			const requestVersion = parseInt(version)
+			if (isNaN(requestVersion)) {
+				return new Response(JSON.stringify({ error: "Invalid version parameter" }), { status: 400 })
+			}
+			if (requestVersion < this.metadata.producer_version) {
+				return new Response(
+					JSON.stringify({
+						error: "Producer version too old",
+						current_version: this.metadata.producer_version,
+						provided_version: requestVersion,
+					}),
+					{ status: 409 }
+				)
+			}
+			// Update metadata if version is higher
+			if (requestVersion > this.metadata.producer_version) {
+				this.metadata.producer_version = requestVersion
+				await this.ctx.storage.put(metadataKey, this.metadata)
+			}
+		}
 
 		// Submit for persistence and wait
 		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
