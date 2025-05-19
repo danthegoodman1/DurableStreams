@@ -1,4 +1,4 @@
-import { unstable_dev } from "wrangler"
+	import { unstable_dev } from "wrangler"
 import type { Unstable_DevWorker } from "wrangler"
 import { describe, expect, it, beforeAll, afterAll, beforeEach } from "vitest"
 import type { ProduceResponse, GetMessagesResponse } from "../src/stream_manager"
