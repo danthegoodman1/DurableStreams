@@ -154,7 +154,7 @@ If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer tha
 
 The major limitation is Durable Objects are limited to 128MB of memory.
 
-As a result, many possible performance optimizations have been dropped in favor of reducing memory overhead (e.g. purging oprhans doing per-object double KV lookups).
+As a result, many possible performance optimizations have been dropped in favor of reducing memory overhead (e.g. purging orphans does extra double KV lookups since data dropped from mem).
 
 You also have to keep in mind the 50GB total storage limit for KV for Durable Objects, which can be raised by contacting Cloudflare, but it's unknown at this time whether you'd get a notification, or just hit some hard wall.
 
