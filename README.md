@@ -117,7 +117,7 @@ It's a funadamentally different model, that same reason you'd use Kafka over Rab
 
 PubSub doesn't hold an infinite history, and queues don't let consumers operate in full isolation (nor have infinite history).
 
-You need streams if you want a event that can persist for long durations, and handle starting consuming from 3 months ago.
+You need streams if you want an event that can persist for long durations, and handle starting consuming from 3 months ago.
 
 ## Differences from Kafka-like systems
 
