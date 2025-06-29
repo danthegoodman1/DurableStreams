@@ -146,7 +146,7 @@ The decision to not support groups is in 2:
 1. That's a lot more complex (would mean a lot more code before releasing)
 2. A single DO probably won't have the bandwidth such that multiple groups are even needed
 
-If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer that manages fanning them out. Or do something like simple like each consumer only actually processes `Murmur3(offset) % N`.
+If you do need to fan-out (e.g. heavy GPU workload), you can have a consumer that manages fanning them out. Or do something simple like each consumer only actually processes `Murmur3(offset) % N`.
 
 ## Other notes
 
