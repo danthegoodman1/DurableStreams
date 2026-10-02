@@ -50,9 +50,9 @@ export class SegmentIndex {
 			.toArray()
 	}
 
-	/** Every segment, oldest first, read lazily. */
-	segments(): Iterable<SegmentMetadata> {
-		return this.sql.exec<SegmentMetadata>(`SELECT ${SEGMENT_COLUMNS} FROM segments ORDER BY last_offset`)
+	/** Every segment holding records after `offset`, oldest first, read lazily. */
+	segments(offset = ""): Iterable<SegmentMetadata> {
+		return this.sql.exec<SegmentMetadata>(`SELECT ${SEGMENT_COLUMNS} FROM segments WHERE last_offset > ? ORDER BY last_offset`, offset)
 	}
 
 	/** Records that `key` is being uploaded; it becomes garbage at `deleteAt` unless committed first. */
@@ -95,6 +95,34 @@ export class SegmentIndex {
 			}
 			throw error
 		}
+	}
+
+	/**
+	 * Schedules the upload at `key` for deletion at `deleteAt` after a failed `replace`, unless a live
+	 * segment covers the same range and therefore owns the object.
+	 */
+	discardUpload(segment: SegmentMetadata, key: string, deleteAt: number): void {
+		const [live] = this.sql
+			.exec("SELECT 1 FROM segments WHERE last_offset = ? AND first_offset = ?", segment.lastOffset, segment.firstOffset)
+			.toArray()
+		if (live === undefined) {
+			this.sql.exec("INSERT OR REPLACE INTO garbage (key, delete_at) VALUES (?, ?)", key, deleteAt)
+		}
+	}
+
+	/**
+	 * Empties the stream: removes every segment and the producer version, and schedules `segmentKeys`
+	 * and all existing garbage for deletion by `deleteAt`.
+	 */
+	clear(segmentKeys: string[], deleteAt: number): void {
+		this.storage.transactionSync(() => {
+			this.sql.exec("DELETE FROM segments")
+			this.sql.exec("UPDATE garbage SET delete_at = MIN(delete_at, ?)", deleteAt)
+			for (const key of segmentKeys) {
+				this.sql.exec("INSERT OR REPLACE INTO garbage (key, delete_at) VALUES (?, ?)", key, deleteAt)
+			}
+			this.storage.kv.delete(PRODUCER_VERSION_KEY)
+		})
 	}
 
 	/** Up to `limit` garbage keys due for deletion at `now`. */

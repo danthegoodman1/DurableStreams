@@ -1,5 +1,6 @@
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { env as cloudflareEnv, exports } from "cloudflare:workers"
-import { expect } from "vitest"
+import { expect, vi } from "vitest"
 import type { StreamManager } from "../src/stream_manager"
 
 export const env = cloudflareEnv as Env
@@ -84,6 +85,17 @@ export function patchBucket(instance: StreamManager, overrides: Partial<R2Bucket
 			},
 		}),
 	}
+}
+
+/** Runs the stream's alarm, or waits for one already running, until no garbage is due. */
+export async function settleMaintenance(stream: string): Promise<void> {
+	await vi.waitFor(async () => {
+		await runDurableObjectAlarm(stub(stream))
+		const due = await runInDurableObject(stub(stream), (_, state) =>
+			state.storage.sql.exec("SELECT key FROM garbage WHERE delete_at <= ?", Date.now()).toArray(),
+		)
+		expect(due).toEqual([])
+	})
 }
 
 export function sleep(ms: number): Promise<void> {

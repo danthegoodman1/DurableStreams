@@ -4,7 +4,7 @@ Durable bottomless event streaming with Cloudflare Durable Objects and R2.
 
 ## Usage
 
-The URL path names the stream: `POST /orders` publishes to the `orders` stream and `GET /orders` reads from it. Paths can contain slashes (`tenant-1/orders`), and names are limited to 256 characters. A consumer can start consuming (e.g. long-poll for new records) before anything is published.
+The URL path names the stream: `POST /orders` publishes to the `orders` stream and `GET /orders` reads from it. Paths can contain slashes (`tenant-1/orders`), and names are limited to 256 characters of percent-encoded path. A consumer can start consuming (e.g. long-poll for new records) before anything is published.
 
 The tests in `test/` are digestible and cover every feature.
 
@@ -30,7 +30,7 @@ Records can be any JSON values. The response lists each record's offset once the
 { "offsets": ["00017909450393370000000000000000", "00017909450393370000000000000001"] }
 ```
 
-Records in one request are stored contiguously and in order.
+Records in one request are stored contiguously and in order. Request bodies are limited to 8 MiB; larger ones get a 413.
 
 #### Publish version (fencing token)
 
@@ -51,6 +51,7 @@ The version acts as a fencing token:
 - Only allows writes if version >= current version
 - Updates the stored version when a higher version is provided
 - Returns 409 if version < current version, with `current_version` and `provided_version` in the body
+- Publishes still waiting to be written when a higher version arrives also get 409
 - Optional - if not provided, writes are always allowed
 
 This is useful for:
@@ -58,7 +59,7 @@ This is useful for:
 - Preventing stale/zombie producers from writing
 - Handling changes in higher-level partition rebalancing (prevent producers from writing to the wrong partition during inconsistency window of producer and partition count)
 
-You can omit records to only raise the producer version, for example between creating a new partition (and making it available for discovery) and pushing updates down to the publishers, to consistently handle rebalancing. That returns the current version:
+You can omit records to only raise the producer version, for example between creating a new partition (and making it available for discovery) and pushing updates down to the publishers, to consistently handle rebalancing. That returns the current version once no publish with an older version can still be written:
 
 ```json
 { "version": 1 }
@@ -86,7 +87,7 @@ interface Record {
 }
 ```
 
-To continue, request again with the last record's offset. A response may hold fewer than `limit` records even when more exist, so keep paging until a request returns no records.
+To continue, request again with the last record's offset. A response may hold fewer than `limit` records even when more exist (for example, reads stop after about 8 MiB of records), so keep paging until a request returns no records.
 
 #### Parameters
 
@@ -96,7 +97,7 @@ To continue, request again with the last record's offset. A response may hold fe
 
 ### Deleting a stream
 
-`DELETE /your-stream-name` deletes every record and resets the producer version. The stream can be published to again afterwards.
+`DELETE /your-stream-name` deletes every record and resets the producer version. The stream reads as empty and accepts new publishes immediately; its R2 objects are deleted in the background.
 
 ### Auth header
 
@@ -104,7 +105,7 @@ Set the `AUTH_HEADER` secret (`wrangler secret put AUTH_HEADER`) to require ever
 
 ### Configuration
 
-These optional variables tune every stream; set them under `vars` in `wrangler.jsonc`. Changing them and redeploying is safe.
+These optional variables tune every stream; set them under `vars` in `wrangler.jsonc`. Changing them and redeploying is safe for existing streams. An invalid value makes every request fail with an error naming the variable.
 
 | Variable                  | Default    | Effect                                                                  |
 | ------------------------- | ---------- | ----------------------------------------------------------------------- |
@@ -127,10 +128,10 @@ Therefore if you want to read from a specific point in time, like now - 30 days,
 
 The Worker authenticates and parses each request, then calls the stream's Durable Object over RPC. Each stream is one SQLite-backed Durable Object, addressed by name.
 
-- **Publishing**: the object buffers publishes for the flush interval, then writes them to R2 as one segment: an immutable object holding a newline-delimited run of records, each prefixed by its offset. It then commits the segment to its SQLite index and responds. Flushes run one at a time so segments commit in offset order.
-- **Reading**: the object finds the first segment holding records after the requested offset and streams segments from R2 until it has `limit` records. Long-polling readers receive each committed batch directly from memory.
+- **Publishing**: the object buffers publishes for the flush interval (or until about 8 MiB is pending), then writes them to R2 as one segment: an immutable object holding a newline-delimited run of records, each prefixed by its offset. It then commits the segment to its SQLite index and responds. Flushes run one at a time so segments commit in offset order.
+- **Reading**: the object finds the first segment holding records after the requested offset and streams segments from R2 until it has `limit` records or about 8 MiB. Long-polling readers receive each committed batch directly from memory.
 - **Compaction**: an alarm merges small adjacent segments in tiers, like an LSM tree. Flushes write level-0 segments; merging `COMPACTION_MAX_SEGMENTS` segments of one level produces one segment a level up, until segments are full. Each record is rewritten only a few times, and reads touch few segments.
-- **Cleanup**: compaction keeps replaced segments for a day so in-flight reads finish, then deletes them. Every upload is recorded before it starts, so an upload that never commits (e.g. after a crash) is deleted too.
+- **Cleanup**: compaction keeps replaced segments for a day so in-flight reads finish, then deletes them. Every upload is recorded before it starts, so an upload that never commits (e.g. after a crash) is deleted too. Deleting a stream empties its index in one transaction and leaves the R2 objects to the same cleanup, so a failure partway through never leaves the stream half-deleted.
 
 R2 keys are `<URL-encoded stream name>/<first offset>-<last offset>.seg`, so a stream's objects never share a prefix with another stream's.
 

@@ -7,6 +7,8 @@ const DEFAULT_LIMIT = 10
 const MAX_LIMIT = 1000
 const MAX_TIMEOUT_SEC = 300
 const MAX_STREAM_NAME_LENGTH = 256
+/** Keeps a publish well under the 32 MiB limit on RPC arguments. */
+const MAX_PUBLISH_BYTES = 8 * 1024 * 1024
 
 type Stream = DurableObjectStub<StreamManager>
 
@@ -61,9 +63,17 @@ function isAuthorized(request: Request, env: Env): boolean {
 }
 
 async function publish(stream: Stream, request: Request, params: URLSearchParams): Promise<Response> {
+	const tooLarge = `Request bodies are limited to ${MAX_PUBLISH_BYTES} bytes`
+	if (Number(request.headers.get("Content-Length")) > MAX_PUBLISH_BYTES) {
+		return errorResponse(413, tooLarge)
+	}
+	const raw = await request.arrayBuffer()
+	if (raw.byteLength > MAX_PUBLISH_BYTES) {
+		return errorResponse(413, tooLarge)
+	}
 	let body: unknown
 	try {
-		body = await request.json()
+		body = JSON.parse(new TextDecoder().decode(raw))
 	} catch {
 		return errorResponse(400, "Invalid JSON body")
 	}

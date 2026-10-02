@@ -2,7 +2,20 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import { streamPrefix } from "../src/segment"
 import type { StreamManager } from "../src/stream_manager"
-import { api, env, garbageRows, patchBucket, publish, r2Keys, readAll, segmentRows, sleep, stub, uniqueStream } from "./helpers"
+import {
+	api,
+	env,
+	garbageRows,
+	patchBucket,
+	publish,
+	r2Keys,
+	readAll,
+	segmentRows,
+	settleMaintenance,
+	sleep,
+	stub,
+	uniqueStream,
+} from "./helpers"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -150,9 +163,69 @@ describe("compaction", () => {
 		await sleep(100)
 		releaseUpload.resolve()
 		await Promise.all([compaction, deleted])
+		await settleMaintenance(stream)
 
 		expect(await r2Keys(prefix)).toEqual([])
 		expect(await runInDurableObject(stub(stream), (_, state) => segmentRows(state))).toEqual([])
 		expect(await readAll(stream)).toEqual([])
+	})
+
+	it("compacts small segments behind full ones, before and after deleting the stream", async () => {
+		const stream = uniqueStream()
+		await publish(
+			stream,
+			Array.from({ length: 5_000 }, (_, i) => i),
+		)
+		await publishSegments(stream, 10, 1)
+		await runDurableObjectAlarm(stub(stream))
+		expect(await runInDurableObject(stub(stream), (_, state) => segmentRows(state).map((row) => [row.records, row.level]))).toEqual([
+			[5_000, 0],
+			[10, 1],
+		])
+
+		await api(stream, { method: "DELETE" })
+		await settleMaintenance(stream)
+		await publishSegments(stream, 10, 1)
+		await runDurableObjectAlarm(stub(stream))
+		expect(await runInDurableObject(stub(stream), (_, state) => segmentRows(state).map((row) => [row.records, row.level]))).toEqual([
+			[10, 1],
+		])
+	})
+
+	it("deletes more garbage than one R2 call accepts", async () => {
+		const stream = uniqueStream()
+		const prefix = streamPrefix(stream)
+		await publish(stream, ["keep"])
+		const keys = Array.from({ length: 1_100 }, (_, i) => `${prefix}garbage-${i}`)
+		for (let i = 0; i < keys.length; i += 100) {
+			await Promise.all(keys.slice(i, i + 100).map((key) => env.SEGMENTS.put(key, "x")))
+		}
+		await runInDurableObject(stub(stream), (_, state) => {
+			for (const key of keys) {
+				state.storage.sql.exec("INSERT INTO garbage (key, delete_at) VALUES (?, 0)", key)
+			}
+		})
+		await runDurableObjectAlarm(stub(stream))
+		expect(await r2Keys(prefix)).toHaveLength(1)
+		expect((await readAll(stream)).map((r) => r.data)).toEqual(["keep"])
+	})
+
+	it("retries failed maintenance later", async () => {
+		const stream = uniqueStream()
+		await publishSegments(stream, 10)
+		await runInDurableObject(stub(stream), async (instance: StreamManager, state) => {
+			patchBucket(instance, {
+				get: async () => {
+					throw new Error("R2 unavailable")
+				},
+			})
+			await state.storage.deleteAlarm()
+			await instance.alarm()
+			expect(segmentRows(state)).toHaveLength(10)
+			expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now() + 30_000)
+			patchBucket(instance, { get: (key: string) => env.SEGMENTS.get(key) })
+		})
+		await runDurableObjectAlarm(stub(stream))
+		expect(await runInDurableObject(stub(stream), (_, state) => segmentRows(state))).toHaveLength(1)
 	})
 })

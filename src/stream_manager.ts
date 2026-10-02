@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers"
-import { pickCompactionWindow } from "./compaction"
+import { isFull, pickCompactionWindow } from "./compaction"
 import { readConfig, type StreamConfig } from "./config"
 import {
 	decodeLine,
@@ -22,12 +22,21 @@ const UPLOAD_GRACE_MS = 60 * 60 * 1000
 const MAINTENANCE_DELAY_MS = 10_000
 /** Compaction time per alarm before the alarm reschedules itself. */
 const MAINTENANCE_BUDGET_MS = 60_000
+/** Delay before retrying maintenance that failed. */
+const MAINTENANCE_RETRY_MS = 60_000
 /** Most segments one read visits; readers page through the rest. */
 const MAX_SEGMENTS_PER_READ = 64
 /** Segments fetched from R2 ahead of the one being read. */
 const READ_AHEAD = 4
 /** R2 deletes at most this many keys per call. */
 const R2_DELETE_BATCH = 1000
+/**
+ * Characters of record JSON returned per read. A read exceeds it only to return a single record. This
+ * keeps results well under the 32 MiB limit on RPC values.
+ */
+export const MAX_READ_CHARS = 8 * 1024 * 1024
+/** Pending record characters that trigger a flush without waiting for the flush interval. */
+const MAX_PENDING_CHARS = 8 * 1024 * 1024
 
 export type PublishResult =
 	{ type: "published"; offsets: string[] } | { type: "version"; version: number } | { type: "fenced"; currentVersion: number }
@@ -42,7 +51,8 @@ export type ReadOptions = {
 
 type PendingPublish = {
 	records: string[]
-	resolve: (offsets: string[]) => void
+	version: number | undefined
+	resolve: (result: PublishResult) => void
 	reject: (error: unknown) => void
 }
 
@@ -50,6 +60,25 @@ type Waiter = {
 	after: string
 	limit: number
 	resolve: (records: StoredRecord[]) => void
+}
+
+/** Collects records up to a count and the read size budget. The first record always fits. */
+class ReadBuffer {
+	readonly records: StoredRecord[] = []
+	private chars = 0
+
+	constructor(private readonly limit: number) {}
+
+	/** Adds `record`, or returns false when the buffer has no room for it. */
+	add(record: StoredRecord): boolean {
+		const chars = record.offset.length + record.data.length
+		if (this.records.length >= this.limit || (this.records.length > 0 && this.chars + chars > MAX_READ_CHARS)) {
+			return false
+		}
+		this.records.push(record)
+		this.chars += chars
+		return true
+	}
 }
 
 /**
@@ -60,16 +89,19 @@ type Waiter = {
 export class StreamManager extends DurableObject<Env> {
 	private readonly config: StreamConfig
 	private readonly prefix: string
-	private index: SegmentIndex
+	private readonly index: SegmentIndex
 	/** The newest committed offset, or "" when the stream is empty. */
 	private lastOffset: string
 	/** Epoch of the newest flush; each flush takes a strictly greater one. */
 	private epoch: number
 	private pending: PendingPublish[] = []
+	private pendingChars = 0
 	private flushTimer: ReturnType<typeof setTimeout> | undefined
 	/** Runs flushes and deletion one at a time, so segments commit in offset order. */
 	private queue: Promise<void> = Promise.resolve()
 	private readonly waiters = new Set<Waiter>()
+	/** Every segment up to this offset is full, so compaction scans start after it. */
+	private fullThrough = ""
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env)
@@ -100,14 +132,17 @@ export class StreamManager extends DurableObject<Env> {
 			}
 		}
 		if (records.length === 0) {
+			// Pending publishes with an older version are fenced when they flush. Waiting for the flush in
+			// progress means none can commit after this returns.
+			await this.serialize(async () => {})
 			return { type: "version", version: this.index.producerVersion() }
 		}
 
-		const offsets = await new Promise<string[]>((resolve, reject) => {
-			this.pending.push({ records, resolve, reject })
+		return new Promise((resolve, reject) => {
+			this.pending.push({ records, version, resolve, reject })
+			this.pendingChars += records.reduce((sum, record) => sum + record.length, 0)
 			this.scheduleFlush()
 		})
-		return { type: "published", offsets }
 	}
 
 	/** Reads up to `limit` records, waiting up to `timeoutMs` for new ones when none are available. */
@@ -124,53 +159,62 @@ export class StreamManager extends DurableObject<Env> {
 		return this.waitForRecords(after, limit, timeoutMs)
 	}
 
-	/** Deletes every record and all stream state. Publishes still pending afterwards start the new stream. */
+	/**
+	 * Deletes every record and resets the producer version. Segments become garbage and the alarm deletes
+	 * them from R2. Publishes still pending afterwards start the new stream.
+	 */
 	async destroy(): Promise<void> {
 		await this.serialize(async () => {
-			await this.ctx.storage.deleteAlarm()
-			let cursor: string | undefined
-			do {
-				const page = await this.env.SEGMENTS.list({ prefix: this.prefix, cursor, limit: R2_DELETE_BATCH })
-				if (page.objects.length > 0) {
-					await this.env.SEGMENTS.delete(page.objects.map((object) => object.key))
-				}
-				cursor = page.truncated ? page.cursor : undefined
-			} while (cursor !== undefined)
-			await this.ctx.storage.deleteAll()
-
-			this.index = new SegmentIndex(this.ctx.storage)
+			const keys = Array.from(this.index.segments(), (segment) => segmentKey(this.prefix, segment))
+			this.index.clear(keys, Date.now())
 			this.lastOffset = ""
+			this.fullThrough = ""
 			for (const waiter of this.waiters) {
 				waiter.resolve([])
 			}
+			await this.scheduleAlarm(Date.now())
 		})
 	}
 
 	/** Maintenance: deletes due garbage, then compacts until no window is ready or the budget runs out. */
 	async alarm(): Promise<void> {
-		await this.collectGarbage()
+		let next: number | null
+		try {
+			await this.collectGarbage()
 
-		const deadline = Date.now() + MAINTENANCE_BUDGET_MS
-		let window = pickCompactionWindow(this.index.segments(), this.config.compaction)
-		while (window.length > 0 && Date.now() < deadline) {
-			await this.compact(window)
-			window = pickCompactionWindow(this.index.segments(), this.config.compaction)
+			const deadline = Date.now() + MAINTENANCE_BUDGET_MS
+			let window = this.nextCompactionWindow()
+			while (window.length > 0 && Date.now() < deadline) {
+				await this.compact(window)
+				window = this.nextCompactionWindow()
+			}
+			next = window.length > 0 ? Date.now() : this.index.nextGarbageAt()
+		} catch (error) {
+			console.error("maintenance failed", error)
+			next = Date.now() + MAINTENANCE_RETRY_MS
 		}
-
-		const next = window.length > 0 ? Date.now() : this.index.nextGarbageAt()
 		if (next !== null) {
 			await this.scheduleAlarm(next)
 		}
 	}
 
 	private scheduleFlush(): void {
-		if (this.flushTimer !== undefined) {
-			return
+		if (this.pendingChars >= MAX_PENDING_CHARS) {
+			if (this.flushTimer !== undefined) {
+				clearTimeout(this.flushTimer)
+				this.flushTimer = undefined
+			}
+			this.startFlush()
+		} else if (this.flushTimer === undefined) {
+			this.flushTimer = setTimeout(() => {
+				this.flushTimer = undefined
+				this.startFlush()
+			}, this.config.flushIntervalMs)
 		}
-		this.flushTimer = setTimeout(() => {
-			this.flushTimer = undefined
-			this.serialize(() => this.flush()).catch((error) => console.error("flush failed", error))
-		}, this.config.flushIntervalMs)
+	}
+
+	private startFlush(): void {
+		this.serialize(() => this.flush()).catch((error) => console.error("flush failed", error))
 	}
 
 	private serialize(task: () => Promise<void>): Promise<void> {
@@ -181,8 +225,17 @@ export class StreamManager extends DurableObject<Env> {
 
 	/** Writes every pending publish as one segment, then resolves the publishers and wakes waiting readers. */
 	private async flush(): Promise<void> {
-		const batch = this.pending
+		const currentVersion = this.index.producerVersion()
+		const batch: PendingPublish[] = []
+		for (const publish of this.pending) {
+			if (publish.version !== undefined && publish.version < currentVersion) {
+				publish.resolve({ type: "fenced", currentVersion })
+			} else {
+				batch.push(publish)
+			}
+		}
 		this.pending = []
+		this.pendingChars = 0
 		if (batch.length === 0) {
 			return
 		}
@@ -208,30 +261,30 @@ export class StreamManager extends DurableObject<Env> {
 
 		try {
 			this.index.trackUpload(key, Date.now() + UPLOAD_GRACE_MS)
+			// Maintenance compacts the segment, or deletes the upload if it never commits.
+			await this.scheduleAlarm(Date.now() + MAINTENANCE_DELAY_MS)
 			await this.env.SEGMENTS.put(key, body)
 			this.index.commit(segment, key)
 		} catch (error) {
 			for (const publish of batch) {
 				publish.reject(error)
 			}
-			// Maintenance deletes the upload if it reached R2.
-			await this.scheduleMaintenance()
 			throw error
 		}
 
 		this.lastOffset = segment.lastOffset
-		batch.forEach((publish, i) => publish.resolve(offsets[i]))
+		batch.forEach((publish, i) => publish.resolve({ type: "published", offsets: offsets[i] }))
 		for (const waiter of this.waiters) {
-			const available = records.filter((record) => record.offset > waiter.after)
-			if (available.length > 0) {
-				waiter.resolve(available.slice(0, waiter.limit))
+			const buffer = new ReadBuffer(waiter.limit)
+			for (const record of records) {
+				if (record.offset > waiter.after && !buffer.add(record)) {
+					break
+				}
+			}
+			if (buffer.records.length > 0) {
+				waiter.resolve(buffer.records)
 			}
 		}
-		await this.scheduleMaintenance()
-	}
-
-	private scheduleMaintenance(): Promise<void> {
-		return this.scheduleAlarm(Date.now() + MAINTENANCE_DELAY_MS)
 	}
 
 	/** Sets the alarm for `at` unless it is already set to go off sooner. */
@@ -242,7 +295,7 @@ export class StreamManager extends DurableObject<Env> {
 		}
 	}
 
-	/** Reads up to `limit` committed records after `after`, following segments in offset order. */
+	/** Reads committed records after `after`, following segments in offset order, until the buffer fills. */
 	private async readCommitted(after: string, limit: number): Promise<StoredRecord[]> {
 		const segments: SegmentMetadata[] = []
 		let available = 0
@@ -256,10 +309,11 @@ export class StreamManager extends DurableObject<Env> {
 		}
 
 		const objects: Promise<R2ObjectBody | null>[] = []
-		const records: StoredRecord[] = []
+		const buffer = new ReadBuffer(limit)
+		let full = false
 		let read = 0
 		try {
-			while (read < segments.length && records.length < limit) {
+			while (read < segments.length && !full) {
 				while (objects.length < Math.min(segments.length, read + READ_AHEAD)) {
 					objects.push(this.env.SEGMENTS.get(segmentKey(this.prefix, segments[objects.length])))
 				}
@@ -270,11 +324,9 @@ export class StreamManager extends DurableObject<Env> {
 				read++
 				for await (const line of readLines(object.body)) {
 					const record = decodeLine(line)
-					if (record.offset > after) {
-						records.push(record)
-						if (records.length >= limit) {
-							break
-						}
+					if (record.offset > after && !buffer.add(record)) {
+						full = true
+						break
 					}
 				}
 			}
@@ -286,7 +338,7 @@ export class StreamManager extends DurableObject<Env> {
 				)
 			}
 		}
-		return records
+		return buffer.records
 	}
 
 	private waitForRecords(after: string, limit: number, timeoutMs: number): Promise<StoredRecord[]> {
@@ -305,6 +357,22 @@ export class StreamManager extends DurableObject<Env> {
 		})
 	}
 
+	private nextCompactionWindow(): SegmentMetadata[] {
+		return pickCompactionWindow(this.compactionCandidates(), this.config.compaction)
+	}
+
+	/** Segments after `fullThrough`, oldest first, advancing `fullThrough` past the leading full ones. */
+	private *compactionCandidates(): Generator<SegmentMetadata> {
+		let leading = true
+		for (const segment of this.index.segments(this.fullThrough)) {
+			leading &&= isFull(segment, this.config.compaction)
+			if (leading) {
+				this.fullThrough = segment.lastOffset
+			}
+			yield segment
+		}
+	}
+
 	/** Merges adjacent `inputs` into one segment a level up. */
 	private async compact(inputs: SegmentMetadata[]): Promise<void> {
 		const merged: SegmentMetadata = {
@@ -320,8 +388,8 @@ export class StreamManager extends DurableObject<Env> {
 		this.index.trackUpload(key, Date.now() + UPLOAD_GRACE_MS)
 		await this.concatenate(inputKeys, key, merged.bytes)
 		if (!this.index.replace(inputs, inputKeys, merged, key, Date.now() + TOMBSTONE_GRACE_MS)) {
-			// The stream was deleted during the merge, along with the garbage entry for `key`.
-			await this.env.SEGMENTS.delete(key)
+			// The stream was deleted during the merge.
+			this.index.discardUpload(merged, key, Date.now())
 		}
 	}
 

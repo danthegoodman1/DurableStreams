@@ -2,7 +2,21 @@ import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "c
 import { describe, expect, it } from "vitest"
 import { streamPrefix } from "../src/segment"
 import type { StreamManager } from "../src/stream_manager"
-import { api, env, garbageRows, patchBucket, publish, r2Keys, read, readAll, segmentRows, sleep, stub, uniqueStream } from "./helpers"
+import {
+	api,
+	env,
+	garbageRows,
+	patchBucket,
+	publish,
+	r2Keys,
+	read,
+	readAll,
+	segmentRows,
+	settleMaintenance,
+	sleep,
+	stub,
+	uniqueStream,
+} from "./helpers"
 
 describe("paging", () => {
 	it("pages through records spread across segments with any limit", async () => {
@@ -79,6 +93,7 @@ describe("publishing", () => {
 
 		const first = publish(stream, ["first"])
 		await putStarted.promise
+		expect(await runInDurableObject(stub(stream), (_, state) => state.storage.getAlarm())).not.toBeNull()
 		const second = publish(stream, ["second"])
 		await sleep(100)
 		releasePut.resolve()
@@ -137,6 +152,53 @@ describe("publishing", () => {
 		expect(await runInDurableObject(stub(stream), (_, state) => garbageRows(state))).toEqual([])
 	})
 
+	it("limits the size of a read, returning at least one record", async () => {
+		const stream = uniqueStream()
+		const big = "x".repeat(1024 * 1024)
+		for (let i = 0; i < 3; i++) {
+			await publish(stream, [big, big, big, big])
+		}
+		const first = await read(stream, { offset: "-", limit: 1000 })
+		expect(first.length).toBeGreaterThan(0)
+		expect(first.length).toBeLessThan(12)
+		expect(first.reduce((sum, record) => sum + (record.data as string).length, 0)).toBeLessThanOrEqual(8 * 1024 * 1024)
+		expect(await readAll(stream)).toHaveLength(12)
+
+		const huge = "y".repeat(7 * 1024 * 1024)
+		await publish(stream, [huge])
+		const [last] = (await readAll(stream)).slice(-1)
+		expect(last.data).toBe(huge)
+	})
+
+	it("limits the size of a batch delivered to a long-polling reader", async () => {
+		const stream = uniqueStream()
+		const reading = read(stream, { limit: 1000, timeout_sec: 5 })
+		await sleep(50)
+		const big = "x".repeat(1024 * 1024)
+		await Promise.all([publish(stream, [big, big, big, big, big, big]), publish(stream, [big, big, big, big, big, big])])
+		const delivered = await reading
+		expect(delivered.length).toBeGreaterThan(0)
+		expect(delivered.reduce((sum, record) => sum + (record.data as string).length, 0)).toBeLessThanOrEqual(8 * 1024 * 1024)
+	})
+
+	it("rejects publish bodies over 8 MiB", async () => {
+		const body = JSON.stringify({ records: ["x".repeat(8 * 1024 * 1024)] })
+		const response = await api(uniqueStream(), { method: "POST", body })
+		expect(response.status).toBe(413)
+	})
+
+	it("flushes as soon as pending records pass the size threshold", async () => {
+		const stream = uniqueStream()
+		await runInDurableObject(stub(stream), (instance: StreamManager) => {
+			const internals = instance as unknown as { config: { flushIntervalMs: number } }
+			internals.config = { ...internals.config, flushIntervalMs: 60_000 }
+		})
+		const started = Date.now()
+		const big = "x".repeat(1024 * 1024)
+		await Promise.all([publish(stream, [big, big, big, big, big]), publish(stream, [big, big, big, big, big])])
+		expect(Date.now() - started).toBeLessThan(30_000)
+	})
+
 	it("schedules maintenance after a flush", async () => {
 		const stream = uniqueStream()
 		await publish(stream, [1])
@@ -169,6 +231,47 @@ describe("producer versions", () => {
 		expect(await unversioned.json()).toEqual({ version: 7 })
 		expect((await api(`${stream}?version=6`, { method: "POST", body: JSON.stringify({ records: [] }) })).status).toBe(409)
 		expect(await readAll(stream)).toEqual([])
+	})
+
+	it("fences publishes still waiting to flush when a newer version arrives", async () => {
+		const stream = uniqueStream()
+		const [stale, bump] = await runInDurableObject(stub(stream), (instance: StreamManager) =>
+			Promise.all([instance.publish(['"stale"'], 1), instance.publish([], 2)]),
+		)
+		expect(bump).toEqual({ type: "version", version: 2 })
+		expect(stale).toEqual({ type: "fenced", currentVersion: 2 })
+		expect(await readAll(stream)).toEqual([])
+	})
+
+	it("acknowledges a new version only after the flush in progress commits", async () => {
+		const stream = uniqueStream()
+		const putStarted = Promise.withResolvers<void>()
+		const releasePut = Promise.withResolvers<void>()
+		await runInDurableObject(stub(stream), (instance: StreamManager) => {
+			const bucket = env.SEGMENTS
+			patchBucket(instance, {
+				put: async (...args: Parameters<R2Bucket["put"]>) => {
+					putStarted.resolve()
+					await releasePut.promise
+					return bucket.put(...args)
+				},
+			})
+		})
+
+		const stale = publish(stream, ["in flight"], "?version=1")
+		await putStarted.promise
+		let bumped = false
+		const bump = api(`${stream}?version=2`, { method: "POST", body: JSON.stringify({ records: [] }) }).then((response) => {
+			bumped = true
+			return response
+		})
+		await sleep(100)
+		expect(bumped).toBe(false)
+
+		releasePut.resolve()
+		await bump
+		expect((await readAll(stream)).map((r) => r.data)).toEqual(["in flight"])
+		await stale
 	})
 })
 
@@ -256,6 +359,7 @@ describe("deleting a stream", () => {
 		const response = await api(stream, { method: "DELETE" })
 		expect(await response.json()).toEqual({ success: true })
 		expect(await readAll(stream)).toEqual([])
+		await settleMaintenance(stream)
 		expect(await r2Keys(streamPrefix(stream))).toEqual([])
 
 		await publish(stream, ["fresh"], "?version=1")
@@ -271,20 +375,38 @@ describe("deleting a stream", () => {
 		}
 
 		await api(stream, { method: "DELETE" })
+		await settleMaintenance(stream)
 		for (const neighbor of neighbors) {
 			expect((await readAll(neighbor)).map((r) => r.data)).toEqual([neighbor])
 			expect(await r2Keys(streamPrefix(neighbor))).toHaveLength(1)
 		}
 	})
 
-	it("deletes more objects than one R2 listing returns", async () => {
+	it("stays deleted when removing objects from R2 fails, and retries later", async () => {
 		const stream = uniqueStream()
-		const prefix = streamPrefix(stream)
-		for (let i = 0; i < 1_100; i += 100) {
-			await Promise.all(Array.from({ length: 100 }, (_, j) => env.SEGMENTS.put(`${prefix}stray-${i + j}`, "x")))
-		}
-		await api(stream, { method: "DELETE" })
-		expect(await r2Keys(prefix)).toEqual([])
+		await publish(stream, ["a"])
+		await publish(stream, ["b"])
+		await runInDurableObject(stub(stream), (instance: StreamManager) => {
+			patchBucket(instance, {
+				delete: async () => {
+					throw new Error("R2 unavailable")
+				},
+			})
+			return instance.destroy()
+		})
+		expect(await readAll(stream)).toEqual([])
+		expect(await r2Keys(streamPrefix(stream))).toHaveLength(2)
+
+		await runInDurableObject(stub(stream), async (instance: StreamManager, state) => {
+			await state.storage.deleteAlarm()
+			await instance.alarm()
+			expect(garbageRows(state)).toHaveLength(2)
+			expect(await state.storage.getAlarm()).toBeGreaterThan(Date.now() + 30_000)
+			patchBucket(instance, { delete: (keys: string | string[]) => env.SEGMENTS.delete(keys) })
+		})
+		expect(await runDurableObjectAlarm(stub(stream))).toBe(true)
+		expect(await r2Keys(streamPrefix(stream))).toEqual([])
+		expect(await readAll(stream)).toEqual([])
 	})
 
 	it("releases waiting readers", async () => {

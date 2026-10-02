@@ -59,18 +59,18 @@ export function segmentKey(prefix: string, segment: Pick<SegmentMetadata, "first
 
 /** Yields each newline-terminated line of `stream`. Stopping early cancels the stream. */
 export async function* readLines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
-	let buffer = ""
+	let partial = ""
 	for await (const chunk of stream.pipeThrough(new TextDecoderStream())) {
-		buffer += chunk
 		let start = 0
 		let newline: number
-		while ((newline = buffer.indexOf("\n", start)) !== -1) {
-			yield buffer.slice(start, newline)
+		while ((newline = chunk.indexOf("\n", start)) !== -1) {
+			yield partial + chunk.slice(start, newline)
+			partial = ""
 			start = newline + 1
 		}
-		buffer = buffer.slice(start)
+		partial += chunk.slice(start)
 	}
-	if (buffer) {
-		yield buffer
+	if (partial) {
+		yield partial
 	}
 }
