@@ -1,0 +1,25 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "durable-streams",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-29",
+	"observability": {
+		"enabled": true,
+	},
+	"durable_objects": {
+		"bindings": [{ "name": "STREAMS", "class_name": "StreamManager" }],
+	},
+	"exports": {
+		"StreamManager": { "type": "durable-object", "storage": "sqlite" },
+	},
+	"r2_buckets": [{ "binding": "SEGMENTS", "bucket_name": "durable-streams" }],
+	/**
+	 * Optional tuning (see README). Set AUTH_HEADER as a secret: `wrangler secret put AUTH_HEADER`.
+	 */
+	// "vars": {
+	// 	"FLUSH_INTERVAL_MS": "200",
+	// 	"COMPACTION_MAX_SEGMENTS": "10",
+	// 	"COMPACTION_MAX_RECORDS": "5000",
+	// 	"COMPACTION_MAX_BYTES": "10000000"
+	// }
+}
