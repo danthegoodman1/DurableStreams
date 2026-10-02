@@ -1,6 +1,7 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { env as cloudflareEnv, exports } from "cloudflare:workers"
 import { expect, vi } from "vitest"
+import type { StreamConfig } from "../src/config"
 import type { StreamManager } from "../src/stream_manager"
 
 export const env = cloudflareEnv as Env
@@ -85,6 +86,17 @@ export function patchBucket(instance: StreamManager, overrides: Partial<R2Bucket
 			},
 		}),
 	}
+}
+
+/** Sets the instance's R2 and compaction timeouts to `ms`. */
+export function shortenTimeouts(instance: StreamManager, ms: number): void {
+	const internals = instance as unknown as { config: StreamConfig }
+	internals.config = { ...internals.config, r2TimeoutMs: ms, compactionTimeoutMs: ms }
+}
+
+/** A stand-in for an R2 call that never returns. */
+export function hang(): Promise<never> {
+	return new Promise(() => {})
 }
 
 /** Runs the stream's alarm, or waits for one already running, until no garbage is due. */

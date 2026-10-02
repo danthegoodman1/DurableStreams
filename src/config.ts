@@ -4,6 +4,10 @@ export type StreamConfig = {
 	/** How long published records wait in memory so concurrent publishes share one segment. */
 	flushIntervalMs: number
 	compaction: CompactionLimits
+	/** Longest wait for an R2 upload, a read's R2 requests, or a batch delete. */
+	r2TimeoutMs: number
+	/** Longest one compaction merge may take. Merged segments are under twice the size limits. */
+	compactionTimeoutMs: number
 }
 
 export function readConfig(env: Env): StreamConfig {
@@ -14,6 +18,8 @@ export function readConfig(env: Env): StreamConfig {
 			maxRecords: readInteger(env, "COMPACTION_MAX_RECORDS", 5_000, 1),
 			maxBytes: readInteger(env, "COMPACTION_MAX_BYTES", 10_000_000, 1),
 		},
+		r2TimeoutMs: 30_000,
+		compactionTimeoutMs: 5 * 60_000,
 	}
 }
 

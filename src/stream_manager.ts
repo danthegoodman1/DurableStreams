@@ -263,7 +263,8 @@ export class StreamManager extends DurableObject<Env> {
 			this.index.trackUpload(key, Date.now() + UPLOAD_GRACE_MS)
 			// Maintenance compacts the segment, or deletes the upload if it never commits.
 			await this.scheduleAlarm(Date.now() + MAINTENANCE_DELAY_MS)
-			await this.env.SEGMENTS.put(key, body)
+			// An upload that lands after timing out stays uncommitted, and maintenance deletes it.
+			await withTimeout(this.env.SEGMENTS.put(key, body), this.config.r2TimeoutMs, `upload of ${key}`)
 			this.index.commit(segment, key)
 		} catch (error) {
 			for (const publish of batch) {
@@ -295,8 +296,12 @@ export class StreamManager extends DurableObject<Env> {
 		}
 	}
 
+	private readCommitted(after: string, limit: number): Promise<StoredRecord[]> {
+		return withTimeout(this.readSegments(after, limit), this.config.r2TimeoutMs, "read")
+	}
+
 	/** Reads committed records after `after`, following segments in offset order, until the buffer fills. */
-	private async readCommitted(after: string, limit: number): Promise<StoredRecord[]> {
+	private async readSegments(after: string, limit: number): Promise<StoredRecord[]> {
 		const segments: SegmentMetadata[] = []
 		let available = 0
 		for (const segment of this.index.segmentsAfter(after, MAX_SEGMENTS_PER_READ)) {
@@ -412,14 +417,28 @@ export class StreamManager extends DurableObject<Env> {
 				throw error
 			}
 		}
-		await Promise.all([upload, copy()])
+		try {
+			await withTimeout(Promise.all([upload, copy()]), this.config.compactionTimeoutMs, `compaction into ${key}`)
+		} catch (error) {
+			// Fails an upload still waiting for input. A pipe in progress holds the lock, so this can fail too.
+			await writable.abort(error).catch(() => {})
+			throw error
+		}
 	}
 
 	private async collectGarbage(): Promise<void> {
 		let keys: string[]
 		while ((keys = this.index.dueGarbage(Date.now(), R2_DELETE_BATCH)).length > 0) {
-			await this.env.SEGMENTS.delete(keys)
+			await withTimeout(this.env.SEGMENTS.delete(keys), this.config.r2TimeoutMs, "garbage delete")
 			this.index.removeGarbage(keys)
 		}
 	}
+}
+
+/** Rejects if `promise` takes longer than `ms`. The work itself is not cancelled; callers abandon it. */
+function withTimeout<T>(promise: Promise<T>, ms: number, operation: string): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`${operation} timed out after ${ms} ms`)), ms)
+		promise.then(resolve, reject).finally(() => clearTimeout(timer))
+	})
 }

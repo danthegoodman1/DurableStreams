@@ -132,6 +132,7 @@ The Worker authenticates and parses each request, then calls the stream's Durabl
 - **Reading**: the object finds the first segment holding records after the requested offset and streams segments from R2 until it has `limit` records or about 8 MiB. Long-polling readers receive each committed batch directly from memory.
 - **Compaction**: an alarm merges small adjacent segments in tiers, like an LSM tree. Flushes write level-0 segments; merging `COMPACTION_MAX_SEGMENTS` segments of one level produces one segment a level up, until segments are full. Each record is rewritten only a few times, and reads touch few segments.
 - **Cleanup**: compaction keeps replaced segments for a day so in-flight reads finish, then deletes them. Every upload is recorded before it starts, so an upload that never commits (e.g. after a crash) is deleted too. Deleting a stream empties its index in one transaction and leaves the R2 objects to the same cleanup, so a failure partway through never leaves the stream half-deleted.
+- **Timeouts**: segment uploads, the R2 requests behind one read, and batch deletes time out after 30 seconds, and compaction merges after 5 minutes. A timed-out upload fails its publishes, and if it lands later it is never committed, so cleanup deletes it. Maintenance retries timed-out work a minute later.
 
 R2 keys are `<URL-encoded stream name>/<first offset>-<last offset>.seg`, so a stream's objects never share a prefix with another stream's.
 
