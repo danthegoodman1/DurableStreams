@@ -1,144 +1,76 @@
-import { RBTree } from "bintrees"
+/**
+ * An offset is 32 digits: the 16-digit epoch (Unix ms) of the flush that wrote the record, then a
+ * 16-digit counter within that flush. The fixed width makes string order match numeric order.
+ */
+export const OFFSET_LENGTH = 32
+const PART_LENGTH = 16
 
-export interface SegmentMetadata {
+export function formatOffset(epoch: number, counter: number): string {
+	return epoch.toString().padStart(PART_LENGTH, "0") + counter.toString().padStart(PART_LENGTH, "0")
+}
+
+export function offsetEpoch(offset: string): number {
+	return Number(offset.slice(0, PART_LENGTH))
+}
+
+/**
+ * Index entry for a segment: one immutable R2 object holding a contiguous run of records.
+ * Segments never overlap, so ordering by first offset and by last offset agree.
+ */
+export type SegmentMetadata = {
 	firstOffset: string
 	lastOffset: string
-	createdMS: number
-	/**
-	 * An optimization to stop the common stream name prefix from being stored
-	 * multiple times in the index would save memory, however this should never be that large.
-	 */
-	name: string
 	records: number
 	bytes: number
+	/** 0 for a flushed segment; one more than its inputs' level for a compacted segment. */
+	level: number
+}
+
+export type StoredRecord = {
+	offset: string
+	/** The record's JSON text. */
+	data: string
 }
 
 /**
- * Async generator that yields each line from a ReadableStream.
+ * Each line of a segment is a record's offset followed by its JSON text. JSON text never contains a
+ * raw newline, so lines split unambiguously, and segments concatenate byte-for-byte.
  */
-export async function* readLines(stream: ReadableStream<Uint8Array>) {
-	const reader = stream.getReader()
-	const decoder = new TextDecoder()
-	let { value: chunk, done } = await reader.read()
-	let buffer = ""
-
-	while (!done) {
-		// Decode the current chunk (streaming mode)
-		buffer += decoder.decode(chunk, { stream: true })
-		// Split on newline (adjust the regex if you need to handle \r\n)
-		let lines = buffer.split("\n")
-		// Keep the last (possibly partial) line in the buffer
-		buffer = lines.pop() || ""
-		// Yield complete lines
-		for (const line of lines) {
-			yield line
-		}
-		;({ value: chunk, done } = await reader.read())
-	}
-
-	// Process any remaining text
-	buffer += decoder.decode() // flush remaining bytes
-	if (buffer) {
-		yield buffer
-	}
+export function encodeLine(record: StoredRecord): string {
+	return `${record.offset}${record.data}\n`
 }
 
-export function generateLogSegmentName(epoch: number, extension: string = ".seg") {
-	return `${epoch}:${crypto.randomUUID()}${extension}`
+export function decodeLine(line: string): StoredRecord {
+	return { offset: line.slice(0, OFFSET_LENGTH), data: line.slice(OFFSET_LENGTH) }
 }
-
-export function generateLogSegmentPath(stream: string, name: string) {
-	return `${stream}/${name}`
-}
-
-export function parseLogSegmentName(name: string): { stream: string; epoch: number; uuid: string } {
-	const [stream, parts] = name.split("/")
-	const [epoch, uuid] = parts.split(".")[0].split(":")
-	return { stream, epoch: Number(epoch), uuid }
-}
-
-// Compaction rules
-const MaxSegments = 10
-// Worst case is (2 * MaxRecords) -1
-const MaxRecords = 5_000
-// Worst case is (2 * MaxBytes) -1
-const MaxBytes = 10_000_000 // 10MB
 
 /**
- * calculateCompactWindow is called to calculate the window of segments that should be compacted.
- *
- * It starts at the back, and aggregates segments until it hits one of the thresholds.
- *
- * If it encounters a segment that individually exceeds the threshold, it will return the window if
- * there are 2 or more segments, otherwise it will reset the window and start from the next segment.
+ * Prefix for a stream's R2 keys. Encoding the name removes every `/`, so no stream's prefix matches
+ * another stream's keys (e.g. stream `a` never lists or deletes objects of stream `a/b`).
  */
-export function calculateCompactWindow(tree: RBTree<SegmentMetadata>): SegmentMetadata[] {
-	// Compact from the oldest segment to the newest
-	const iter = tree.iterator()
-	let item: SegmentMetadata | null = null
-	// did you know you could do this in JS?
-	let segmentWindow: SegmentMetadata[] = []
-	let totalBytes = 0
-	let totalRecords = 0
-	while ((item = iter.next()) !== null) {
-		// We keep iterating until we hit a max number of segments, records, or bytes
-		// or, the next file already is too large to compact (we skip to start next window)
+export function streamPrefix(streamName: string): string {
+	return `${encodeURIComponent(streamName)}/`
+}
 
-		// Check the window limits
-		if (segmentWindow.length >= MaxSegments) {
-			// We hit the max number of segments, so we need to compact
-			console.debug("hit max number of segments, compacting")
-			break
-		}
-		if (totalBytes >= MaxBytes) {
-			// We hit the max number of bytes, so we need to compact
-			console.debug("hit max number of bytes, compacting")
-			break
-		}
-		if (totalRecords >= MaxRecords) {
-			// We hit the max number of records, so we need to compact
-			console.debug("hit max number of records, compacting")
-			break
-		}
+/** Segments are named by their offset range, which makes R2 listings sorted and self-describing. */
+export function segmentKey(prefix: string, segment: Pick<SegmentMetadata, "firstOffset" | "lastOffset">): string {
+	return `${prefix}${segment.firstOffset}-${segment.lastOffset}.seg`
+}
 
-		// Check if we need to start a new window by skipping, or compact what we have
-		if (item.bytes > MaxBytes) {
-			if (segmentWindow.length < 2) {
-				// We need to skip and start a new window
-				console.debug(`next file ${item.name} has too many bytes, skipping because we don't have enough segments to compact`)
-				segmentWindow = []
-				continue
-			}
-
-			// Otherwise we need to compact what we have
-			console.debug(`next file ${item.name} has too many bytes, compacting`)
-			break
+/** Yields each newline-terminated line of `stream`. Stopping early cancels the stream. */
+export async function* readLines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+	let partial = ""
+	for await (const chunk of stream.pipeThrough(new TextDecoderStream())) {
+		let start = 0
+		let newline: number
+		while ((newline = chunk.indexOf("\n", start)) !== -1) {
+			yield partial + chunk.slice(start, newline)
+			partial = ""
+			start = newline + 1
 		}
-		if (item.records > MaxRecords) {
-			if (segmentWindow.length < 2) {
-				// We need to skip and start a new window
-				console.debug(`next file ${item.name} has too many records, skipping because we don't have enough segments to compact`)
-				segmentWindow = []
-				continue
-			}
-
-			// Otherwise we need to compact what we have
-			console.debug(`next file ${item.name} has too many records, compacting`)
-			break
-		}
-
-		segmentWindow.push(item)
-		totalBytes += item.bytes
-		totalRecords += item.records
+		partial += chunk.slice(start)
 	}
-
-	// We either broke to compact, or we hit the end of the tree
-
-	if (segmentWindow.length < 2) {
-		// We don't have enough segments to compact, so we can't compact
-		console.debug("not enough segments to compact after iteration, exiting")
-		return []
+	if (partial) {
+		yield partial
 	}
-
-	return segmentWindow
 }

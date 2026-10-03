@@ -1,759 +1,444 @@
-import { EventEmitter } from "node:events"
 import { DurableObject } from "cloudflare:workers"
+import { isFull, pickCompactionWindow } from "./compaction"
+import { readConfig, type StreamConfig } from "./config"
 import {
-	calculateCompactWindow,
-	generateLogSegmentName,
-	generateLogSegmentPath,
-	parseLogSegmentName,
+	decodeLine,
+	encodeLine,
+	formatOffset,
+	offsetEpoch,
 	readLines,
-	SegmentMetadata,
+	segmentKey,
+	streamPrefix,
+	type SegmentMetadata,
+	type StoredRecord,
 } from "./segment"
-import { RBTree } from "bintrees"
-import { Mutex } from "async-mutex"
+import { SegmentIndex } from "./segment_index"
 
-const FlushIntervalMs = 200
-const hour = 1000 * 60 * 60
-const day = hour * 24
-const MaxTombstoneAgeMs = day * 1
-const CompactLogSegmentsChance = 1 // temp for testing
-const CleanTombstonesChance = 0.01
-const OrphanPurgingChance = 0.0001
+/** How long segments replaced by compaction stay in R2 so in-flight reads can finish. */
+const TOMBSTONE_GRACE_MS = 24 * 60 * 60 * 1000
+/** How long an upload may take before its object counts as orphaned. */
+const UPLOAD_GRACE_MS = 60 * 60 * 1000
+/** Delay from a flush to the maintenance alarm, so one alarm compacts many flushes. */
+const MAINTENANCE_DELAY_MS = 10_000
+/** Compaction time per alarm before the alarm reschedules itself. */
+const MAINTENANCE_BUDGET_MS = 60_000
+/** Delay before retrying maintenance that failed. */
+const MAINTENANCE_RETRY_MS = 60_000
+/** Most segments one read visits; readers page through the rest. */
+const MAX_SEGMENTS_PER_READ = 64
+/** Segments fetched from R2 ahead of the one being read. */
+const READ_AHEAD = 4
+/** R2 deletes at most this many keys per call. */
+const R2_DELETE_BATCH = 1000
+/**
+ * Characters of record JSON returned per read. A read exceeds it only to return a single record. This
+ * keeps results well under the 32 MiB limit on RPC values.
+ */
+export const MAX_READ_CHARS = 8 * 1024 * 1024
+/** Pending record characters that trigger a flush without waiting for the flush interval. */
+const MAX_PENDING_CHARS = 8 * 1024 * 1024
 
-const activeLogSegmentKey = "active_log_segment::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
-const tombstoneKey = "tombstone::" // what logs segments are actually active, used for compaction, tombstone cleaning, and queries
-const metadataKey = "_metadata" // stream metadata like producer version
+export type PublishResult =
+	{ type: "published"; offsets: string[] } | { type: "version"; version: number } | { type: "fenced"; currentVersion: number }
 
-function buildLogSegmentIndexKey(segmentName: string): string {
-	return `${activeLogSegmentKey}${segmentName}`
-}
-
-function buildTombstoneKey(segmentName: string): string {
-	return `${tombstoneKey}${segmentName}`
-}
-
-export interface PendingMessage {
-	emitter: EventEmitter<{ resolve: [string[]]; error: [Error] }>
-	/**
-	 * Pre-serialized records so we can pre-calculate the length of write streams
-	 */
-	records: string[]
-}
-
-export interface GetMessagesRequest {
-	consumerID: string
-
-	// "" (or the same offset as the last message) means we long poll until a new message comes in, "-" means we start from the first offset
-	offset: string
+export type ReadOptions = {
+	/** Read records after this offset; "" reads from the beginning. Omit to wait for the next records published. */
+	after?: string
 	limit: number
-	// only used for long polling
-	timeout_sec: number
+	/** How long to wait for new records when none are available. */
+	timeoutMs: number
 }
 
-export interface GetMessagesResponse {
-	records: Record[]
+type PendingPublish = {
+	records: string[]
+	version: number | undefined
+	resolve: (result: PublishResult) => void
+	reject: (error: unknown) => void
 }
 
-export interface Record {
-	offset: string
-	data: any
+type Waiter = {
+	after: string
+	limit: number
+	resolve: (records: StoredRecord[]) => void
 }
 
-export interface ProduceBody {
-	records: any[]
+/** Collects records up to a count and the read size budget. The first record always fits. */
+class ReadBuffer {
+	readonly records: StoredRecord[] = []
+	private chars = 0
+
+	constructor(private readonly limit: number) {}
+
+	/** Adds `record`, or returns false when the buffer has no room for it. */
+	add(record: StoredRecord): boolean {
+		const chars = record.offset.length + record.data.length
+		if (this.records.length >= this.limit || (this.records.length > 0 && this.chars + chars > MAX_READ_CHARS)) {
+			return false
+		}
+		this.records.push(record)
+		this.chars += chars
+		return true
+	}
 }
 
-export interface ProduceResponse {
-	offsets: string[][]
-}
-
-export interface StreamMetadata {
-	/**
-	 * This is an optional version that the producer can use as a fencing token for higher-level coordination.
-	 */
-	producer_version: number
-}
-
-function parseOffset(offset: string): { epoch: number; counter: number } {
-	const epoch = offset.slice(0, 16)
-	const counter = offset.slice(16)
-	return { epoch: Number(epoch), counter: Number(counter) }
-}
-
-function serializeOffset(epoch: number, counter: number | string): string {
-	// 16 digits is max safe integer for JS
-	return `${epoch.toString().padStart(16, "0")}${counter.toString().padStart(16, "0")}`
-}
-
+/**
+ * One stream. Publishes are buffered for `flushIntervalMs`, then written to R2 as one segment and
+ * committed to the SQLite index. Long-polling readers receive each committed batch from memory.
+ * An alarm compacts small segments and deletes garbage in the background.
+ */
 export class StreamManager extends DurableObject<Env> {
-	consumers: Map<string, { emitter: EventEmitter<{ records: [Record[]] }>; limit: number }> = new Map()
-
-	lastOffset: string = ""
-	streamName: string = ""
-	epoch: number = Date.now()
-	counter: number = 0
-	metadata: StreamMetadata = { producer_version: 0 }
-
-	tree: RBTree<SegmentMetadata>
-	treeMutex = new Mutex()
-
-	// Messages that are pending persistence in the flush interval
-	pendingMessages: PendingMessage[] = []
-
-	setup_listener?: EventEmitter<{ finish: [] }>
-	setup = false
+	private readonly config: StreamConfig
+	private readonly prefix: string
+	private readonly index: SegmentIndex
+	/** The newest committed offset, or "" when the stream is empty. */
+	private lastOffset: string
+	/** Epoch of the newest flush; each flush takes a strictly greater one. */
+	private epoch: number
+	private pending: PendingPublish[] = []
+	private pendingChars = 0
+	private flushTimer: ReturnType<typeof setTimeout> | undefined
+	/** Runs flushes and deletion one at a time, so segments commit in offset order. */
+	private queue: Promise<void> = Promise.resolve()
+	private readonly waiters = new Set<Waiter>()
+	/** Every segment up to this offset is full, so compaction scans start after it. */
+	private fullThrough = ""
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env)
-
-		// We know 2 things to be true about SegmentMetadata:
-		// 1. firstOffset is always less than or equal to lastOffset
-		// 2. No instances SegmentMetadata can have intersecting offset ranges
-		// Therefore we can make decisions entirely off of the first offset
-		this.tree = new RBTree<SegmentMetadata>((a, b) => {
-			// Return 0 if a == b
-			// > 0 if a>b
-			// < 0 if a<b
-			if (a.firstOffset < b.firstOffset) {
-				// a is before b
-				return -1
-			}
-			if (a.firstOffset > b.firstOffset) {
-				// a is after b
-				return 1
-			}
-
-			// They are the same segment (search key)
-			return 0
-		})
-	}
-
-	finishSetup() {
-		this.setup = true
-		this.setup_listener!.emit("finish")
+		const name = ctx.id.name
+		if (name === undefined) {
+			throw new Error("StreamManager must be addressed by name")
+		}
+		this.config = readConfig(env)
+		this.prefix = streamPrefix(name)
+		this.index = new SegmentIndex(ctx.storage)
+		this.lastOffset = this.index.lastOffset()
+		this.epoch = this.lastOffset ? offsetEpoch(this.lastOffset) : 0
 	}
 
 	/**
-	 * Ensures that we load the latest state from storage before we being processing requests
+	 * Appends `records`, each the JSON text of one record, and resolves with their offsets once they are
+	 * durable. `version` is an optional fencing token: publishes with a version below the highest seen
+	 * are rejected, and a higher version replaces it. With no records, only the version is updated.
 	 */
-	async ensureSetup() {
-		const release = await this.treeMutex.acquire()
-		try {
-			if (this.setup_listener) {
-				console.log("Waiting for setup to finish")
-				// We are not the first instance to start up, so wait for the setup to finish
-				await new Promise<void>((resolve) => this.setup_listener!.once("finish", resolve))
-				return
+	async publish(records: string[], version?: number): Promise<PublishResult> {
+		if (version !== undefined) {
+			const current = this.index.producerVersion()
+			if (version < current) {
+				return { type: "fenced", currentVersion: current }
 			}
-
-			console.log("Doing setup")
-
-			// We are the first instance to start up, so we need to do the setup
-			this.setup_listener = new EventEmitter<{ finish: [] }>()
-
-			// Load metadata first
-			const storedMetadata = await this.ctx.storage.get<StreamMetadata>(metadataKey)
-			if (storedMetadata) {
-				this.metadata = storedMetadata
-			}
-
-			console.log("Building index from storage")
-			await this.buildIndexFromStorage()
-
-			if (this.tree.size === 0) {
-				console.debug("No segments found, skipping setup")
-				return this.finishSetup()
-			}
-
-			// Load the previous epoch if we have it. When we go to write
-			// we'll increment this and handle clock drift
-			const maxRecord = this.tree.max()!
-			this.epoch = parseOffset(maxRecord.lastOffset).epoch
-			const { stream } = parseLogSegmentName(maxRecord.name)
-			this.streamName = stream
-			console.debug(`Setup complete, epoch: ${this.epoch}, streamName: ${this.streamName}`)
-
-			this.finishSetup()
-		} finally {
-			release()
-		}
-	}
-
-	async fetch(request: Request): Promise<Response> {
-		if (this.env.AUTH_HEADER && request.headers.get("auth") !== this.env.AUTH_HEADER) {
-			return new Response("Unauthorized", { status: 401 })
-		}
-
-		console.log("fetch", request.url, request.method)
-		// Always set streamName from the URL first
-		this.streamName = new URL(request.url).pathname
-
-		if (!this.setup) {
-			await this.ensureSetup()
-		}
-
-		if (request.method === "PUT") {
-			return this.handleMetaRequest(request)
-		}
-
-		if (request.method === "POST") {
-			return this.handleProduce(request)
-		}
-
-		if (request.method === "DELETE") {
-			await this.destroy()
-			return new Response(JSON.stringify({ success: true }), { status: 200 })
-		}
-
-		const url = new URL(request.url)
-
-		const offset = url.searchParams.get("offset")
-		const limit = url.searchParams.get("limit")
-		const timeout_sec = url.searchParams.get("timeout_sec")
-
-		const payload: GetMessagesRequest = {
-			consumerID: crypto.randomUUID(),
-			offset: offset ?? "",
-			limit: Number(limit) ?? 10, // low default avoid OOM
-			timeout_sec: Number(timeout_sec) ?? 0,
-		}
-
-		return this.handleGetMessagesRequest(payload)
-	}
-
-	async handleMetaRequest(request: Request): Promise<Response> {
-		// TODO: add method to force compaction for testing
-		// TODO: add method to force tombstone cleanup for testing
-		// TODO: add method to set compaction settings
-		return new Response("NOT IMPLEMENTED", { status: 405 })
-	}
-
-	async handleProduce(request: Request): Promise<Response> {
-		// Read the body first before doing anything else
-		let body: ProduceBody
-		try {
-			body = await request.json()
-		} catch (e) {
-			return new Response(JSON.stringify({ error: "Invalid JSON body" }), { status: 400 })
-		}
-
-		const url = new URL(request.url)
-		const version = url.searchParams.get("version")
-
-		// If version is provided, check it against current producer version
-		if (version !== null) {
-			const requestVersion = parseInt(version)
-			if (isNaN(requestVersion)) {
-				return new Response(JSON.stringify({ error: "Invalid version parameter" }), { status: 400 })
-			}
-			if (requestVersion < this.metadata.producer_version) {
-				return new Response(
-					JSON.stringify({
-						error: "Producer version too old",
-						current_version: this.metadata.producer_version,
-						provided_version: requestVersion,
-					}),
-					{ status: 409 }
-				)
-			}
-			// Update metadata if version is higher
-			if (requestVersion > this.metadata.producer_version) {
-				this.metadata.producer_version = requestVersion
-				await this.ctx.storage.put(metadataKey, this.metadata)
+			if (version > current) {
+				this.index.setProducerVersion(version)
 			}
 		}
-
-		if (body.records.length === 0) {
-			// We probably just incremented the version
-			return new Response(JSON.stringify({ version: this.metadata.producer_version }), { status: 200 })
+		if (records.length === 0) {
+			// Pending publishes with an older version are fenced when they flush. Waiting for the flush in
+			// progress means none can commit after this returns.
+			await this.serialize(async () => {})
+			return { type: "version", version: this.index.producerVersion() }
 		}
 
-		// Submit for persistence and wait
-		const emitter = new EventEmitter<{ resolve: [string[]]; error: [Error] }>()
-		this.pendingMessages.push({ emitter, records: body.records.map((r) => JSON.stringify(r)) })
-		if (this.pendingMessages.length === 1) {
-			// Set the alarm to flush the pending messages
-			await this.ctx.storage.setAlarm(Date.now() + FlushIntervalMs)
-		}
-		console.debug("waiting for flush")
-		const offsetOrError = await Promise.any([
-			new Promise<string[]>((resolve) => emitter.once("resolve", resolve)),
-			new Promise<Error>((resolve) => emitter.once("error", resolve)),
-		])
-
-		if (offsetOrError instanceof Error) {
-			return new Response(JSON.stringify({ error: offsetOrError.message }), {
-				status: 500,
-			})
-		}
-
-		// Return the persistence result
-		return new Response(JSON.stringify({ offsets: offsetOrError }), {
-			status: 200,
+		return new Promise((resolve, reject) => {
+			this.pending.push({ records, version, resolve, reject })
+			this.pendingChars += records.reduce((sum, record) => sum + record.length, 0)
+			this.scheduleFlush()
 		})
 	}
 
-	async handleGetMessagesRequest(payload: GetMessagesRequest): Promise<Response> {
-		let records: Record[] = []
-		if (payload.offset) {
-			records = await this.getMessagesFromOffset(payload.offset, payload.limit)
+	/** Reads up to `limit` records, waiting up to `timeoutMs` for new ones when none are available. */
+	async read({ after, limit, timeoutMs }: ReadOptions): Promise<StoredRecord[]> {
+		after ??= this.lastOffset
+		const records = await this.readCommitted(after, limit)
+		if (records.length > 0 || timeoutMs <= 0) {
+			return records
 		}
-
-		if (!payload.timeout_sec || records.length > 0) {
-			return new Response(JSON.stringify({ records } as GetMessagesResponse), {
-				status: 200,
-			})
+		if (this.lastOffset > after) {
+			// A flush committed while the read was in flight.
+			return this.readCommitted(after, limit)
 		}
+		return this.waitForRecords(after, limit, timeoutMs)
+	}
 
-		// For long polling, capture the current lastOffset as the starting point.
-		const emitter = new EventEmitter<{ records: [Record[]] }>()
-		this.consumers.set(payload.consumerID, { emitter, limit: payload.limit })
-		const res = await Promise.race([
-			new Promise<Record[]>((resolve) => emitter.once("records", resolve)),
-			new Promise<Error>((resolve) => setTimeout(() => resolve(new Error("timeout")), payload.timeout_sec * 1000)), // timeout after timeout_sec seconds
-		])
-
-		if (res instanceof Error) {
-			// Remove the emitter from the consumers map
-			this.consumers.delete(payload.consumerID)
-			return new Response(JSON.stringify({ records: [] } as GetMessagesResponse), {
-				status: 200,
-			})
-		}
-
-		return new Response(JSON.stringify({ records: res } as GetMessagesResponse), {
-			status: 200,
+	/**
+	 * Deletes every record and resets the producer version. Segments become garbage and the alarm deletes
+	 * them from R2. Publishes still pending afterwards start the new stream.
+	 */
+	async destroy(): Promise<void> {
+		await this.serialize(async () => {
+			const keys = Array.from(this.index.segments(), (segment) => segmentKey(this.prefix, segment))
+			this.index.clear(keys, Date.now())
+			this.lastOffset = ""
+			this.fullThrough = ""
+			for (const waiter of this.waiters) {
+				waiter.resolve([])
+			}
+			await this.scheduleAlarm(Date.now())
 		})
 	}
 
-	async getMessagesFromOffset(offset: string, limit: number): Promise<Record[]> {
-		// get the item from the tree that's below the offset
-		const segment = await this.getSegmentAfterOffset(offset)
-		if (!segment) {
-			// We didn't find a segment that contains the offset, so we return an empty array
-			console.debug(`no messages segment found for offset ${offset}`)
-			return []
+	/** Maintenance: deletes due garbage, then compacts until no window is ready or the budget runs out. */
+	async alarm(): Promise<void> {
+		let next: number | null
+		try {
+			await this.collectGarbage()
+
+			const deadline = Date.now() + MAINTENANCE_BUDGET_MS
+			let window = this.nextCompactionWindow()
+			while (window.length > 0 && Date.now() < deadline) {
+				await this.compact(window)
+				window = this.nextCompactionWindow()
+			}
+			next = window.length > 0 ? Date.now() : this.index.nextGarbageAt()
+		} catch (error) {
+			console.error("maintenance failed", error)
+			next = Date.now() + MAINTENANCE_RETRY_MS
+		}
+		if (next !== null) {
+			await this.scheduleAlarm(next)
+		}
+	}
+
+	private scheduleFlush(): void {
+		if (this.pendingChars >= MAX_PENDING_CHARS) {
+			if (this.flushTimer !== undefined) {
+				clearTimeout(this.flushTimer)
+				this.flushTimer = undefined
+			}
+			this.startFlush()
+		} else if (this.flushTimer === undefined) {
+			this.flushTimer = setTimeout(() => {
+				this.flushTimer = undefined
+				this.startFlush()
+			}, this.config.flushIntervalMs)
+		}
+	}
+
+	private startFlush(): void {
+		this.serialize(() => this.flush()).catch((error) => console.error("flush failed", error))
+	}
+
+	private serialize(task: () => Promise<void>): Promise<void> {
+		const run = this.queue.then(task)
+		this.queue = run.catch(() => {})
+		return run
+	}
+
+	/** Writes every pending publish as one segment, then resolves the publishers and wakes waiting readers. */
+	private async flush(): Promise<void> {
+		const currentVersion = this.index.producerVersion()
+		const batch: PendingPublish[] = []
+		for (const publish of this.pending) {
+			if (publish.version !== undefined && publish.version < currentVersion) {
+				publish.resolve({ type: "fenced", currentVersion })
+			} else {
+				batch.push(publish)
+			}
+		}
+		this.pending = []
+		this.pendingChars = 0
+		if (batch.length === 0) {
+			return
 		}
 
-		// verify the offset is in the range
-		if (offset !== "-" && segment.lastOffset < offset) {
-			// The offset is outside the range, this is a bug
-			console.error("Offset is outside the range of the segment", offset, segment)
-			return []
+		this.epoch = Math.max(Date.now(), this.epoch + 1)
+		const records: StoredRecord[] = []
+		const offsets = batch.map((publish) =>
+			publish.records.map((data) => {
+				const offset = formatOffset(this.epoch, records.length)
+				records.push({ offset, data })
+				return offset
+			}),
+		)
+		const body = new TextEncoder().encode(records.map(encodeLine).join(""))
+		const segment: SegmentMetadata = {
+			firstOffset: records[0].offset,
+			lastOffset: records[records.length - 1].offset,
+			records: records.length,
+			bytes: body.byteLength,
+			level: 0,
+		}
+		const key = segmentKey(this.prefix, segment)
+
+		try {
+			this.index.trackUpload(key, Date.now() + UPLOAD_GRACE_MS)
+			// Maintenance compacts the segment, or deletes the upload if it never commits.
+			await this.scheduleAlarm(Date.now() + MAINTENANCE_DELAY_MS)
+			// An upload that lands after timing out stays uncommitted, and maintenance deletes it.
+			await withTimeout(this.env.SEGMENTS.put(key, body), this.config.r2TimeoutMs, `upload of ${key}`)
+			this.index.commit(segment, key)
+		} catch (error) {
+			for (const publish of batch) {
+				publish.reject(error)
+			}
+			throw error
 		}
 
-		// Load the segment from R2
-		const segmentData = await this.env.StreamData.get(generateLogSegmentPath(this.streamName, segment.name))
-		if (!segmentData) {
-			// The segment doesn't exist, this is a bug
-			console.error("Segment does not exist", segment)
-			return []
-		}
-
-		// Stream the records from the segment up to limit
-		const records: Record[] = []
-		for await (const line of readLines(segmentData.body)) {
-			console.debug(`reading line ${line}`)
-			const recordOffset = line.slice(0, 32)
-			const data = line.slice(32)
-			if (recordOffset > offset) {
-				let jsonData: any
-				try {
-					console.debug(`parsing record ${data}`)
-					jsonData = JSON.parse(data) // get 32:-1 to remove the offset and newline
-				} catch (e) {
-					// This is a bug, the segment is corrupt
-					throw Error(`Error parsing record (is the segment corrupt?): ${e}`)
-				}
-
-				records.push({ offset: recordOffset, data: jsonData })
-				if (records.length >= limit) {
+		this.lastOffset = segment.lastOffset
+		batch.forEach((publish, i) => publish.resolve({ type: "published", offsets: offsets[i] }))
+		for (const waiter of this.waiters) {
+			const buffer = new ReadBuffer(waiter.limit)
+			for (const record of records) {
+				if (record.offset > waiter.after && !buffer.add(record)) {
 					break
 				}
 			}
-		}
-
-		// if we didn't hit the limit, repeat from the new offset (last record we streamed)
-		if (records.length < limit) {
-			console.debug(`getting more messages from offset ${records[records.length - 1].offset}`)
-			records.push(...(await this.getMessagesFromOffset(records[records.length - 1].offset, limit - records.length)))
-		}
-
-		return records
-	}
-
-	async alarm(alarmInfo?: AlarmInvocationInfo) {
-		console.debug("alarm waking up")
-		// Do these sequentially so they're not racing for locks
-		await this.flushPendingMessages()
-		await this.compactLogSegments()
-		await this.cleanTombstones()
-		await this.purgeOrphans()
-	}
-
-	calculateTotalLength(pendingMessages: PendingMessage[]) {
-		// Calculate the total overhead: 33 bytes per record (32 bytes for the offset name + 1 byte for the newline)
-		const totalOverhead = pendingMessages.reduce((acc, m) => acc + m.records.length, 0) * 33
-		// Sum of lengths of all the JSON record strings
-		const totalRecordsLength = pendingMessages.reduce((acc, m) => acc + m.records.reduce((acc, r) => acc + r.length, 0), 0)
-		return totalOverhead + totalRecordsLength
-	}
-
-	async flushPendingMessages() {
-		console.debug("flushing pending messages")
-		// Increment the epoch and reset the counter
-		const oldEpoch = this.epoch
-		this.epoch = Date.now()
-		this.counter = 0
-		if (this.epoch <= oldEpoch) {
-			// What the heck, we went back in time? Clocks man... Let's just jump forward by 1
-			console.warn("Clock went back in time, incrementing epoch")
-			this.epoch = oldEpoch + 1
-		}
-
-		const segmentName = generateLogSegmentName(this.epoch)
-
-		const offsets: string[][] = []
-		for (const message of this.pendingMessages) {
-			// For each of the writes, we need to generate an offset for each record
-			const messageOffsets = []
-			for (const _ of message.records) {
-				// For each record, we need to generate an offset
-				messageOffsets.push(serializeOffset(this.epoch, this.counter))
-				this.counter++
-			}
-			offsets.push(messageOffsets)
-		}
-
-		this.lastOffset = offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1]
-
-		// Write the pending messages to the log segment
-		console.debug("writing pending messages to log segment")
-		await this.writePendingMessagesToLogSegment(this.streamName, segmentName, offsets, this.pendingMessages)
-
-		// Write the log segment metadata so the segment is persisted
-		console.debug("writing log segment metadata")
-		await this.treeMutex.runExclusive(async () => {
-			await this.writeLogSegmentMetadata({
-				name: segmentName,
-				firstOffset: offsets[0][0],
-				lastOffset: offsets[offsets.length - 1][offsets[offsets.length - 1].length - 1],
-				createdMS: Date.now(),
-				records: this.counter, // the counter is the number of records written
-				bytes: this.calculateTotalLength(this.pendingMessages),
-			})
-		})
-
-		// Notify producer emitters to return
-		for (let i = 0; i < this.pendingMessages.length; i++) {
-			this.pendingMessages[i].emitter.emit("resolve", offsets[i])
-		}
-
-		// Clear the pending messages
-		this.pendingMessages = []
-
-		// Send records to waiting consumers
-		console.debug("poking consumers to get new messages")
-		for (const [consumerID, consumer] of this.consumers.entries()) {
-			// We need to use the offset just below this epoch, so we don't miss any records so decrement epoch and use max counter
-			const pokeOffset = serializeOffset(this.epoch - 1, "9".repeat(16))
-			console.debug(`getting messages from offset ${offsets[0][0]} using poke offset ${pokeOffset} for consumer ${consumerID}`)
-			const records = await this.getMessagesFromOffset(pokeOffset, consumer.limit)
-			console.debug(`got ${records.length} records for consumer ${consumerID}`)
-			if (records.length > 0) {
-				console.debug(`emitting ${records.length} records to consumer ${consumerID}`)
-				consumer.emitter.emit("records", records)
-				this.consumers.delete(consumerID)
+			if (buffer.records.length > 0) {
+				waiter.resolve(buffer.records)
 			}
 		}
 	}
 
-	async writePendingMessagesToLogSegment(streamName: string, segmentName: string, offsets: string[][], pendingMessages: PendingMessage[]) {
-		const totalLength = this.calculateTotalLength(pendingMessages)
+	/** Sets the alarm for `at` unless it is already set to go off sooner. */
+	private async scheduleAlarm(at: number): Promise<void> {
+		const current = await this.ctx.storage.getAlarm()
+		if (current === null || current > at) {
+			await this.ctx.storage.setAlarm(at)
+		}
+	}
 
-		const segmentPath = generateLogSegmentPath(streamName, segmentName)
+	private readCommitted(after: string, limit: number): Promise<StoredRecord[]> {
+		return withTimeout(this.readSegments(after, limit), this.config.r2TimeoutMs, "read")
+	}
 
-		const { readable, writable } = new FixedLengthStream(totalLength)
-		const writer = writable.getWriter()
-
-		// Start streaming the records to the file
-		const writePromise = this.env.StreamData.put(segmentPath, readable)
-
-		// Write the records to the file
-		let records = 0
-		let actualLength = 0
-		for (let i = 0; i < pendingMessages.length; i++) {
-			for (let j = 0; j < pendingMessages[i].records.length; j++) {
-				const name = offsets[i][j]
-				const nameBuffer = new TextEncoder().encode(name)
-				const jsonBuffer = new TextEncoder().encode(pendingMessages[i].records[j])
-				writer.write(nameBuffer)
-				writer.write(jsonBuffer)
-				writer.write(new TextEncoder().encode("\n"))
-				actualLength += nameBuffer.length + jsonBuffer.length + 1
-				records++
+	/** Reads committed records after `after`, following segments in offset order, until the buffer fills. */
+	private async readSegments(after: string, limit: number): Promise<StoredRecord[]> {
+		const segments: SegmentMetadata[] = []
+		let available = 0
+		for (const segment of this.index.segmentsAfter(after, MAX_SEGMENTS_PER_READ)) {
+			if (available >= limit) {
+				break
 			}
+			segments.push(segment)
+			// Only the first segment can straddle `after`; it holds at least one record after it.
+			available += segment.firstOffset > after ? segment.records : 1
 		}
 
-		console.debug(`Writing ${records} records to ${segmentPath} with actual length ${actualLength} and expected length ${totalLength}`)
-		await Promise.all([writer.close(), writePromise])
-		console.log(`Wrote ${records} records to ${segmentPath}`)
-	}
-
-	// Tree must be locked before calling this
-	async buildIndexFromStorage() {
-		const segments = await this.ctx.storage.list<SegmentMetadata>({
-			prefix: activeLogSegmentKey,
-		})
-
-		for (const [_, segment] of segments) {
-			this.tree.insert(segment)
-		}
-	}
-
-	// Tree must be locked before calling this
-	async writeLogSegmentMetadata(metadata: SegmentMetadata) {
-		// First we need to durably store it
-		await this.ctx.storage.put(buildLogSegmentIndexKey(metadata.name), metadata)
-		// Then we can add it to the memory index
-		this.tree.insert(metadata)
-	}
-
-	async compactLogSegments() {
-		if (Math.random() > CompactLogSegmentsChance) {
-			console.debug("NOT compacting log segments")
-			return
-		}
-
-		console.debug("compacting log segments")
-		const segmentWindow = await this.treeMutex.runExclusive(async () => calculateCompactWindow(this.tree))
-		if (segmentWindow.length < 2) {
-			// We don't have enough segments to compact, so we can't compact
-			console.debug("not enough segments to compact after iteration, exiting")
-			return
-		}
-		console.debug(`compacting ${segmentWindow.length} segments: ${segmentWindow.map((s) => JSON.stringify(s, null, 2)).join(", ")}`)
-
-		// k-way merge the segments with line readers to a new segment file
-		const totalLength = segmentWindow.reduce((acc, s) => acc + s.bytes, 0)
-		const newSegmentName = generateLogSegmentName(this.epoch, ".compacted.seg")
-
-		const { readable, writable } = new FixedLengthStream(totalLength)
-		const writer = writable.getWriter()
-
-		// Start streaming the records to the file
-		const writePromise = this.env.StreamData.put(generateLogSegmentPath(this.streamName, newSegmentName), readable)
-
-		// Create a reader for each of the segments
-		const readers = await Promise.all(
-			segmentWindow.map(async (s) => this.env.StreamData.get(generateLogSegmentPath(this.streamName, s.name)))
-		)
-		// Verify all the readers are valid
-		for (let i = 0; i < segmentWindow.length; i++) {
-			if (!readers[i]) {
-				console.error(`Segment ${segmentWindow[i].name} does not exist, data is corrupted`)
-				return
-			}
-		}
-
-		// We can write each segment sequentially since they're contiguous and ordered
-		const processPromise = async () => {
-			try {
-				for (const reader of readers) {
-					if (!reader) continue
-
-					// Process each line from the current segment and write directly to the output
-					for await (const line of readLines(reader.body)) {
-						const buffer = new TextEncoder().encode(line + "\n")
-						await writer.write(buffer)
+		const objects: Promise<R2ObjectBody | null>[] = []
+		const buffer = new ReadBuffer(limit)
+		let full = false
+		let read = 0
+		try {
+			while (read < segments.length && !full) {
+				while (objects.length < Math.min(segments.length, read + READ_AHEAD)) {
+					objects.push(this.env.SEGMENTS.get(segmentKey(this.prefix, segments[objects.length])))
+				}
+				const object = await objects[read]
+				if (object === null) {
+					throw new Error(`segment ${segmentKey(this.prefix, segments[read])} is missing from R2`)
+				}
+				read++
+				for await (const line of readLines(object.body)) {
+					const record = decodeLine(line)
+					if (record.offset > after && !buffer.add(record)) {
+						full = true
+						break
 					}
 				}
-			} finally {
-				await writer.close()
 			}
-		}
-
-		// Start processing segments sequentially
-		const mergePromise = processPromise()
-
-		// Finally, wait for the record to be persisted to R2.
-		await Promise.all([mergePromise, writePromise])
-
-		const newSegment: SegmentMetadata = {
-			name: newSegmentName,
-			firstOffset: segmentWindow[0].firstOffset,
-			lastOffset: segmentWindow[segmentWindow.length - 1].lastOffset,
-			createdMS: Date.now(),
-			records: segmentWindow.reduce((acc, s) => acc + s.records, 0),
-			bytes: totalLength,
-		}
-
-		// transaction to update log segments and store tombstones
-		// if we crash here it's ok since we recover the tree
-		await this.ctx.storage.transaction(async (tx) => {
-			for (const segment of segmentWindow) {
-				await tx.delete(buildLogSegmentIndexKey(segment.name))
-				await tx.put(buildTombstoneKey(segment.name), segment)
-			}
-			await tx.put(buildLogSegmentIndexKey(newSegment.name), newSegment)
-		})
-
-		// grab tree lock and update the tree
-		await this.treeMutex.runExclusive(async () => {
-			for (const segment of segmentWindow) {
-				this.tree.remove(segment)
-			}
-			this.tree.insert(newSegment)
-		})
-
-		console.debug("compacted log segments into", newSegment)
-	}
-
-	async cleanTombstones() {
-		if (Math.random() > CleanTombstonesChance) {
-			return
-		}
-
-		console.debug("cleaning tombstones")
-
-		const items = await this.ctx.storage.list<SegmentMetadata>({
-			prefix: tombstoneKey,
-		})
-		const now = Date.now()
-		for (const [_, item] of items) {
-			if (item.createdMS < now - MaxTombstoneAgeMs) {
-				console.debug(`Deleting tombstone ${item.name}`)
-				// Delete it from R2 first to make sure we do it
-				try {
-					await this.env.StreamData.delete(generateLogSegmentPath(this.streamName, item.name))
-				} catch (error) {
-					console.error(`Error deleting tombstone ${item.name} from R2, did it already get deleted?`, error)
-				}
-
-				// Delete it from the tombstone index
-				await this.ctx.storage.delete(buildTombstoneKey(item.name))
-			}
-		}
-	}
-
-	async purgeOrphans() {
-		if (Math.random() > OrphanPurgingChance) {
-			return
-		}
-
-		console.debug("purging orphans")
-
-		// Use cursor-based pagination to iterate through R2 objects
-		let cursor: string | undefined = undefined
-		do {
-			// Get a batch of objects from R2
-			const r2Objects = await this.env.StreamData.list({
-				prefix: `${this.streamName}/`,
-				cursor,
-				limit: 100, // Process in reasonable chunks
-			})
-
-			// Process this batch
-			for (const obj of r2Objects.objects) {
-				// Extract segment name from the R2 key
-				const segmentPath = obj.key
-				const segmentName = segmentPath.split("/").pop()!
-
-				// Check if this segment exists in either active segments or tombstones
-				const [activeMetadata, tombstoneMetadata] = await Promise.all([
-					this.ctx.storage.get<SegmentMetadata>(buildLogSegmentIndexKey(segmentName)),
-					this.ctx.storage.get<SegmentMetadata>(buildTombstoneKey(segmentName)),
-				])
-
-				if (!activeMetadata && !tombstoneMetadata) {
-					console.info(`Found orphaned R2 object: ${obj.key} - deleting`)
-					await this.env.StreamData.delete(obj.key)
-				}
-			}
-
-			// Get cursor for next batch
-			cursor = r2Objects.truncated ? r2Objects.objects[r2Objects.objects.length - 1].key : undefined
-		} while (cursor)
-	}
-
-	// This helper function returns the SegmentMetadata that will contain the first offset AFTER the given offset
-	async getSegmentAfterOffset(offset: string): Promise<SegmentMetadata | null> {
-		// Create a dummy search key with the provided offset.
-		const searchKey = { firstOffset: offset } as SegmentMetadata
-
-		const release = await this.treeMutex.acquire()
-		try {
-			if (offset === "-") {
-				// If the offset is "-", we want the first segment
-				console.debug("getting first segment from '-' offset")
-				return this.tree.min()
-			}
-
-			// Use the tree's lowerBound to find the first element whose firstOffset is >= offset.
-			const it = this.tree.lowerBound(searchKey)
-			let candidate: SegmentMetadata | null = null
-
-			// If lowerBound doesn't return an element, the tree may be empty or the offset is greater than all segments.
-			const segment = it.data()
-			console.debug("segment", segment)
-			if (segment === null) {
-				console.debug(`no lower bound segment found for offset ${offset}`)
-				candidate = this.tree.max()
-			} else if (segment.lastOffset > offset) {
-				// Otherwise the segment is the candidate
-				candidate = segment
-			}
-
-			// Verify the candidate's last offset is greater than the offset (single record segment)
-			if (candidate && candidate.lastOffset > offset) {
-				console.debug(`found segment ${candidate.name} covering offset ${offset}`)
-				return candidate
-			}
-
-			console.debug(`no segment covering offset ${offset} was found`)
-			return null
 		} finally {
-			release()
+			for (const unread of objects.slice(read)) {
+				unread.then(
+					(object) => object?.body.cancel(),
+					() => {},
+				)
+			}
+		}
+		return buffer.records
+	}
+
+	private waitForRecords(after: string, limit: number, timeoutMs: number): Promise<StoredRecord[]> {
+		return new Promise((resolve) => {
+			const waiter: Waiter = {
+				after,
+				limit,
+				resolve: (records) => {
+					clearTimeout(timer)
+					this.waiters.delete(waiter)
+					resolve(records)
+				},
+			}
+			const timer = setTimeout(() => waiter.resolve([]), timeoutMs)
+			this.waiters.add(waiter)
+		})
+	}
+
+	private nextCompactionWindow(): SegmentMetadata[] {
+		return pickCompactionWindow(this.compactionCandidates(), this.config.compaction)
+	}
+
+	/** Segments after `fullThrough`, oldest first, advancing `fullThrough` past the leading full ones. */
+	private *compactionCandidates(): Generator<SegmentMetadata> {
+		let leading = true
+		for (const segment of this.index.segments(this.fullThrough)) {
+			leading &&= isFull(segment, this.config.compaction)
+			if (leading) {
+				this.fullThrough = segment.lastOffset
+			}
+			yield segment
 		}
 	}
 
-	/**
-	 * Delete the stream and all associated data
-	 */
-	async destroy() {
-		console.log(`Destroying stream ${this.streamName}`)
+	/** Merges adjacent `inputs` into one segment a level up. */
+	private async compact(inputs: SegmentMetadata[]): Promise<void> {
+		const merged: SegmentMetadata = {
+			firstOffset: inputs[0].firstOffset,
+			lastOffset: inputs[inputs.length - 1].lastOffset,
+			records: inputs.reduce((sum, input) => sum + input.records, 0),
+			bytes: inputs.reduce((sum, input) => sum + input.bytes, 0),
+			level: inputs[0].level + 1,
+		}
+		const key = segmentKey(this.prefix, merged)
+		const inputKeys = inputs.map((input) => segmentKey(this.prefix, input))
 
-		// Cancel any pending operations
-		this.pendingMessages = []
-		this.consumers.clear()
-
-		// Delete all R2 objects for this stream
-		let cursor: string | undefined = undefined
-		do {
-			const r2Objects = await this.env.StreamData.list({
-				prefix: `${this.streamName}/`,
-				cursor,
-				limit: 100,
-			})
-
-			// Delete objects in batches
-			const deletePromises = r2Objects.objects.map((obj) => this.env.StreamData.delete(obj.key))
-			await Promise.all(deletePromises)
-
-			cursor = r2Objects.truncated ? r2Objects.objects[r2Objects.objects.length - 1].key : undefined
-		} while (cursor)
-
-		await this.ctx.storage.deleteAll()
-
-		// Clear in-memory state
-		await this.treeMutex.runExclusive(() => {
-			this.tree.clear()
-		})
-
-		this.lastOffset = ""
-		this.epoch = Date.now()
-		this.counter = 0
-		this.metadata = { producer_version: 0 }
-
-		console.log(`Stream ${this.streamName} destroyed successfully`)
+		this.index.trackUpload(key, Date.now() + UPLOAD_GRACE_MS)
+		await this.concatenate(inputKeys, key, merged.bytes)
+		if (!this.index.replace(inputs, inputKeys, merged, key, Date.now() + TOMBSTONE_GRACE_MS)) {
+			// The stream was deleted during the merge.
+			this.index.discardUpload(merged, key, Date.now())
+		}
 	}
+
+	/** Streams the objects at `inputKeys`, in order, into one new object at `key`. */
+	private async concatenate(inputKeys: string[], key: string, bytes: number): Promise<void> {
+		const { readable, writable } = new FixedLengthStream(bytes)
+		const upload = this.env.SEGMENTS.put(key, readable)
+		const copy = async () => {
+			try {
+				for (const inputKey of inputKeys) {
+					const object = await this.env.SEGMENTS.get(inputKey)
+					if (object === null) {
+						throw new Error(`segment ${inputKey} is missing from R2`)
+					}
+					await object.body.pipeTo(writable, { preventClose: true })
+				}
+				await writable.close()
+			} catch (error) {
+				await writable.abort(error).catch(() => {})
+				throw error
+			}
+		}
+		try {
+			await withTimeout(Promise.all([upload, copy()]), this.config.compactionTimeoutMs, `compaction into ${key}`)
+		} catch (error) {
+			// Fails an upload still waiting for input. A pipe in progress holds the lock, so this can fail too.
+			await writable.abort(error).catch(() => {})
+			throw error
+		}
+	}
+
+	private async collectGarbage(): Promise<void> {
+		let keys: string[]
+		while ((keys = this.index.dueGarbage(Date.now(), R2_DELETE_BATCH)).length > 0) {
+			await withTimeout(this.env.SEGMENTS.delete(keys), this.config.r2TimeoutMs, "garbage delete")
+			this.index.removeGarbage(keys)
+		}
+	}
+}
+
+/** Rejects if `promise` takes longer than `ms`. The work itself is not cancelled; callers abandon it. */
+function withTimeout<T>(promise: Promise<T>, ms: number, operation: string): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`${operation} timed out after ${ms} ms`)), ms)
+		promise.then(resolve, reject).finally(() => clearTimeout(timer))
+	})
 }
